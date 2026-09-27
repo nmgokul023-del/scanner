@@ -67,7 +67,8 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
   const [totalBytesStr, setTotalBytesStr] = useState<string>('0 MB');
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isDevelopmentMode, setIsDevelopmentMode] = useState<boolean>(true);
+  const [isDevelopmentMode, setIsDevelopmentMode] = useState<boolean>(false);
+  const [aiModelInfo, setAiModelInfo] = useState<any>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
@@ -136,6 +137,17 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
   // Check for active / running job on component mount (Refresh Safety)
   useEffect(() => {
     const initPage = async () => {
+      try {
+        const modelRes = await fetch('/api/ai/model-status');
+        if (modelRes.ok) {
+          const modelData = await modelRes.json();
+          setAiModelInfo(modelData);
+          setIsDevelopmentMode(!modelData.weights_loaded);
+        }
+      } catch (e) {
+        console.error('Error checking AI model status:', e);
+      }
+
       const list = await loadDatasetsList();
       const savedDatasetId = localStorage.getItem('urbancadastral_active_dataset');
       
@@ -333,73 +345,33 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
       mapInstanceRef.current = null;
     }
 
-    const bounds: L.LatLngBoundsExpression = currentDataset.bounds || [
-      [12.9740, 77.6340],
-      [12.9840, 77.6460]
-    ];
+    const isGeoref = Array.isArray(currentDataset.bounds) && currentDataset.bounds.length >= 2;
+    const bounds: L.LatLngBoundsExpression = isGeoref
+      ? currentDataset.bounds
+      : [[0, 0], [currentDataset.height_px || 1000, currentDataset.width_px || 1000]];
 
-    const centerLat = (bounds[0][0] + bounds[1][0]) / 2.0;
-    const centerLon = (bounds[0][1] + bounds[1][1]) / 2.0;
+    const centerLat = isGeoref ? (currentDataset.bounds[0][0] + currentDataset.bounds[1][0]) / 2.0 : (currentDataset.height_px || 1000) / 2.0;
+    const centerLon = isGeoref ? (currentDataset.bounds[0][1] + currentDataset.bounds[1][1]) / 2.0 : (currentDataset.width_px || 1000) / 2.0;
 
     const map = L.map(mapContainerRef.current, {
       center: [centerLat, centerLon],
-      zoom: 15,
+      zoom: isGeoref ? 15 : 1,
       zoomControl: false,
       attributionControl: false
     });
 
-    // Satellite base
-    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-      maxZoom: 20
-    }).addTo(map);
-
-    // Overlay real raster preview if available from backend
-    const previewUrl = apiClient.getDroneImageryPreviewUrl(currentDataset.id);
-    const imgOverlay = L.imageOverlay(previewUrl, bounds, { opacity: 0.85 }).addTo(map);
-
-    // Coverage boundary outline
-    const poly = L.polygon([
-      [bounds[0][0], bounds[0][1]],
-      [bounds[1][0], bounds[0][1]],
-      [bounds[1][0], bounds[1][1]],
-      [bounds[0][0], bounds[1][1]]
-    ], {
-      color: '#2563eb',
-      weight: 3,
-      fillColor: '#3b82f6',
-      fillOpacity: 0.15,
-      dashArray: '6, 6'
-    }).addTo(map);
-
-    poly.bindTooltip(`${currentDataset.name || 'Coverage'}: ${currentDataset.coverage_str || '4.2 km²'} (${currentDataset.resolution || '5 cm'})`, {
-      permanent: true,
-      direction: 'center',
-      className: 'font-sans text-xs font-bold text-slate-800 bg-white/95 p-2 rounded-xl shadow border border-slate-200'
-    });
-
-    // Flight paths simulation overlay
-    const latSpan = bounds[1][0] - bounds[0][0];
-    const step = latSpan / 5.0;
-    for (let l = bounds[0][0] + step; l < bounds[1][0]; l += step) {
-      L.polyline([[l, bounds[0][1]], [l, bounds[1][1]]], {
-        color: '#ffffff',
-        weight: 1.5,
-        opacity: 0.7,
-        dashArray: '4, 4'
+    // Satellite base only when georeferenced
+    if (isGeoref) {
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 20
       }).addTo(map);
     }
 
-    // CORS Benchmark Point
-    const corsPt = L.circleMarker([centerLat, centerLon], {
-      radius: 7,
-      fillColor: '#10b981',
-      color: '#ffffff',
-      weight: 2,
-      fillOpacity: 1
-    }).addTo(map);
-    corsPt.bindTooltip('CORS RTK Checkpoint TN-04 (Accuracy: 1.8cm)', { permanent: false });
+    // Overlay real raster preview from backend
+    const previewUrl = apiClient.getDroneImageryPreviewUrl(currentDataset.id);
+    L.imageOverlay(previewUrl, bounds as any, { opacity: 0.95 }).addTo(map);
+    map.fitBounds(bounds as any, { padding: [20, 20] });
 
-    map.fitBounds(bounds);
     mapInstanceRef.current = map;
 
     return () => {
@@ -513,45 +485,39 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
   };
 
   // Download Generated Results
-  const handleDownloadGeoJSON = () => {
-    const geojsonData = {
-      type: "FeatureCollection",
-      features: [
-        {
-          type: "Feature",
-          properties: {
-            dataset: currentDataset?.name || "Drone Dataset",
-            parcels_count: processedStats.parcels_detected,
-            status: "AI Extracted"
-          },
-          geometry: {
-            type: "Polygon",
-            coordinates: [[[77.6340, 12.9740], [77.6460, 12.9740], [77.6460, 12.9840], [77.6340, 12.9840], [77.6340, 12.9740]]]
-          }
-        }
-      ]
-    };
-    const blob = new Blob([JSON.stringify(geojsonData, null, 2)], { type: 'application/geo+json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `cadastral_parcels_${currentDataset?.id || 'dataset'}.geojson`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleDownloadGeoJSON = async () => {
+    try {
+      const res = await fetch('/api/gis/geojson');
+      const geojsonData = await res.json();
+      const blob = new Blob([JSON.stringify(geojsonData, null, 2)], { type: 'application/geo+json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `cadastral_parcels_${currentDataset?.id || 'dataset'}.geojson`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('Download error:', e);
+    }
   };
 
-  const handleDownloadCSV = () => {
-    const csvContent = `Parcel_ID,Zone,Status,Confidence,Area_SQM
-8824-A,M-2,AI Extracted,0.94,1248.5
-8825-B,R-3,Verified,0.98,920.0
-8826-C,C-1,Flagged Discrepancy,0.72,1650.0`;
-    const blob = new Blob([csvContent], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `cadastral_parcels_${currentDataset?.id || 'dataset'}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleDownloadCSV = async () => {
+    try {
+      const parcels = await apiClient.getParcels();
+      let csvContent = 'Parcel_ID,Zone,Status,Confidence,Area_SQM\n';
+      for (const p of parcels) {
+        csvContent += `${p.parcel_id},${p.zone || 'General'},${p.status},${p.confidence_score ?? 'Not Available'},${p.ai_area_sqm ?? 'Not Available'}\n`;
+      }
+      const blob = new Blob([csvContent], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `cadastral_parcels_${currentDataset?.id || 'dataset'}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('CSV download error:', e);
+    }
   };
 
   // Map Controls
@@ -596,15 +562,42 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
         )}
       </div>
 
-      {/* DEVELOPMENT MODE BANNER (Section 17) */}
-      {isDevelopmentMode && (
-        <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4 flex items-start gap-3 text-xs text-blue-900 shadow-sm">
-          <Info className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
+      {/* AI MODEL STATUS BANNER */}
+      {aiModelInfo ? (
+        <div className={`border rounded-2xl p-4 flex items-start gap-3 text-xs shadow-sm ${
+          aiModelInfo.weights_loaded
+            ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+            : 'bg-amber-50 border-amber-200 text-amber-900'
+        }`}>
+          {aiModelInfo.weights_loaded ? (
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+          ) : (
+            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          )}
           <div className="space-y-0.5">
-            <span className="font-bold">Development Processing Mode Active</span>
-            <p className="text-blue-800 text-[11px] leading-relaxed">
-              This dataset is being processed using the development pipeline interface. Connect a trained AI model (YOLO, Mask R-CNN, SAM) in <code>backend/models/weights/</code> to enable production neural segmentation.
+            <div className="flex items-center gap-2">
+              <span className="font-bold">
+                {aiModelInfo.weights_loaded ? 'STATUS: REAL AI SCANNING READY' : 'STATUS: AI MODEL NOT INSTALLED'}
+              </span>
+              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                aiModelInfo.weights_loaded ? 'bg-emerald-200 text-emerald-800' : 'bg-amber-200 text-amber-800'
+              }`}>
+                {aiModelInfo.weights_loaded ? 'AI MODEL: INSTALLED & VERIFIED' : 'TRAINED MODEL WEIGHTS REQUIRED'}
+              </span>
+            </div>
+            <p className={`text-[11px] leading-relaxed ${aiModelInfo.weights_loaded ? 'text-emerald-800' : 'text-amber-800'}`}>
+              {aiModelInfo.weights_loaded
+                ? `Active ONNX Segmentation Model: ${aiModelInfo.model_path || 'cadastral_segmentation_unet.onnx'} (${aiModelInfo.num_classes || 6} classes: Background, Building, Road, Vegetation, Water, Open Land). Real drone orthomosaic scanning enabled.`
+                : 'Neural model weights are not found in backend/models/weights/. To run real neural segmentation, install cadastral segmentation ONNX/PyTorch weights. Synthetic/simulated generation is disabled.'}
             </p>
+          </div>
+        </div>
+      ) : (
+        <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 flex items-start gap-3 text-xs text-slate-700 shadow-sm">
+          <Info className="w-5 h-5 text-slate-500 shrink-0 mt-0.5" />
+          <div>
+            <span className="font-bold">AI Pipeline Status: </span>
+            <span>Checking neural segmentation model availability...</span>
           </div>
         </div>
       )}
@@ -820,9 +813,9 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
                         <div className="text-[10px] text-slate-400 font-mono">{ds.original_filename || ds.filename}</div>
                       </td>
                       <td className="py-3 px-3 font-semibold text-slate-600">{ds.data_type || ds.type}</td>
-                      <td className="py-3 px-3 text-slate-500">{ds.file_size_str || ds.filesize || '2.8 GB'}</td>
-                      <td className="py-3 px-3 font-mono font-bold text-blue-600">{ds.resolution || '5 cm'}</td>
-                      <td className="py-3 px-3 font-medium text-slate-700">{ds.coverage_str || ds.coverage || '4.2 km²'}</td>
+                      <td className="py-3 px-3 text-slate-500">{ds.file_size_str || ds.filesize || 'Not Available'}</td>
+                      <td className="py-3 px-3 font-mono font-bold text-blue-600">{ds.resolution || 'Not Available'}</td>
+                      <td className="py-3 px-3 font-medium text-slate-700">{ds.coverage_str || ds.coverage || 'Not Available'}</td>
                       <td className="py-3 px-3">
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
                           ds.upload_status === 'processed' || ds.status === 'Processed'
@@ -901,7 +894,7 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
               <span>✓ Dataset Ready for AI Processing</span>
             </div>
             <div className="font-mono text-emerald-800 font-semibold text-[11px]">
-              CRS: {currentDataset?.crs || 'EPSG:4326'} &bull; GSD: {currentDataset?.resolution || '5 cm'} &bull; Coverage: {currentDataset?.coverage_str || '4.2 km²'}
+              CRS: {currentDataset?.crs || 'Unreferenced Image'} &bull; GSD: {currentDataset?.resolution || 'Not Available'} &bull; Coverage: {currentDataset?.coverage_str || 'Not Available'}
             </div>
           </div>
         </div>
@@ -955,7 +948,7 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
               <div className={`lg:col-span-2 relative ${isFullscreen ? 'h-[600px]' : 'h-80 sm:h-96'} rounded-2xl overflow-hidden border border-slate-200 shadow-inner`}>
                 <div ref={mapContainerRef} className="w-full h-full" />
                 <div className="absolute bottom-3 left-3 bg-slate-900/80 backdrop-blur-sm text-white px-3 py-1.5 rounded-xl text-[11px] font-mono border border-slate-700">
-                  Coverage: {currentDataset?.coverage_str || '4.2 km²'} &bull; GSD: {currentDataset?.resolution || '5 cm'} &bull; Real Raster Overlay
+                  Coverage: {currentDataset?.coverage_str || 'Not Available'} &bull; GSD: {currentDataset?.resolution || 'Not Available'} &bull; Real Raster Preview
                 </div>
               </div>
 
@@ -977,23 +970,23 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500 font-medium">Resolution (GSD):</span>
-                    <span className="font-bold text-blue-600">{currentDataset?.resolution || '5 cm / pixel'}</span>
+                    <span className="font-bold text-blue-600">{currentDataset?.resolution || 'Not Available'}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500 font-medium">CRS:</span>
-                    <span className="font-mono font-bold text-slate-900">{currentDataset?.crs || 'EPSG:4326'}</span>
+                    <span className="font-mono font-bold text-slate-900">{currentDataset?.crs || 'Unreferenced Image'}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500 font-medium">Dimensions:</span>
-                    <span className="font-mono text-slate-900">{currentDataset?.width_px ? `${currentDataset.width_px.toLocaleString()} × ${currentDataset.height_px.toLocaleString()} px` : '28,450 × 19,820 px'}</span>
+                    <span className="font-mono text-slate-900">{currentDataset?.width_px ? `${currentDataset.width_px.toLocaleString()} × ${currentDataset.height_px.toLocaleString()} px` : 'Not Available'}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500 font-medium">File Size:</span>
-                    <span className="font-bold text-slate-900">{currentDataset?.file_size_str || '2.8 GB'}</span>
+                    <span className="font-bold text-slate-900">{currentDataset?.file_size_str || 'Not Available'}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500 font-medium">Coverage Area:</span>
-                    <span className="font-bold text-emerald-700">{currentDataset?.coverage_str || '4.2 km²'}</span>
+                    <span className="font-bold text-emerald-700">{currentDataset?.coverage_str || 'Not Available'}</span>
                   </div>
                 </div>
               </div>
@@ -1221,7 +1214,7 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
             <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-1">
               <div className="text-[10px] font-bold text-slate-400 uppercase">Buildings Extracted</div>
               <div className="text-2xl font-extrabold text-indigo-700">{processedStats.buildings_extracted.toLocaleString()}</div>
-              <div className="text-[10px] text-slate-400">Mean height 14.6m</div>
+              <div className="text-[10px] text-slate-400">2D Footprints</div>
             </div>
 
             <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-1">
@@ -1239,7 +1232,7 @@ export const DroneImageryUpload: React.FC<DroneImageryUploadProps> = ({
             <div className="p-4 bg-emerald-50/50 rounded-2xl border border-emerald-200 space-y-1">
               <div className="text-[10px] font-bold text-emerald-600 uppercase">High Confidence</div>
               <div className="text-2xl font-extrabold text-emerald-700">{processedStats.high_confidence_features.toLocaleString()}</div>
-              <div className="text-[10px] text-emerald-600 font-semibold">&gt; 90% AI Accuracy</div>
+              <div className="text-[10px] text-emerald-600 font-semibold">&gt; 0.85 Softmax Conf.</div>
             </div>
           </div>
 

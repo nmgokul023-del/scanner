@@ -22,8 +22,22 @@ wheels/
 *.egg
 .env
 .venv
+.venv/
 venv/
 ENV/
+
+# Data and Outputs
+data/raw/
+data/processed/
+outputs/
+
+# Trained model weights (no large weights)
+*.pt
+*.pth
+*.onnx
+backend/models/weights/*.pt
+backend/models/weights/*.pth
+backend/models/weights/*.onnx
 
 # Node / Frontend
 node_modules/
@@ -40,9 +54,15 @@ backend/data/uploads/*
 !backend/data/uploads/.gitkeep
 !backend/data/uploads/ground_truth/.gitkeep
 
-# Local SQLite databases (keep schema / mock files)
+# Archives & Temporary Scratch Scripts
+*.zip
+scratch/
+UrbanCadastral_Build.zip
+
+# Local SQLite journals
 *.sqlite3-journal
 *.db-journal
+backend/data/cadastral.db
 
 # IDE & OS
 .vscode/

@@ -25,6 +25,30 @@ def format_file_size(size_bytes: int) -> str:
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes} B"
 
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".las", ".laz", ".zip", ".geojson", ".json", ".gpkg"}
+
+def validate_magic_bytes(file_path: str, ext: str):
+    """Validates binary magic bytes to prevent renamed malicious or corrupted files."""
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(16)
+        if ext in (".jpg", ".jpeg"):
+            if not header.startswith(b"\xff\xd8"):
+                raise HTTPException(status_code=400, detail="Invalid JPEG image: header signature mismatch.")
+        elif ext == ".png":
+            if not header.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise HTTPException(status_code=400, detail="Invalid PNG image: header signature mismatch.")
+        elif ext in (".tif", ".tiff"):
+            if not (header.startswith(b"II*\x00") or header.startswith(b"MM\x00*")):
+                raise HTTPException(status_code=400, detail="Invalid TIFF/GeoTIFF raster: header signature mismatch.")
+        elif ext == ".gpkg":
+            if not header.startswith(b"SQLite format 3\x00"):
+                raise HTTPException(status_code=400, detail="Invalid GeoPackage file: header signature mismatch.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed inspecting file header: {str(e)}")
+
 class DroneUploadService:
     @staticmethod
     async def save_uploaded_file(file: UploadFile, dataset_id: str) -> Dict[str, Any]:
@@ -33,6 +57,14 @@ class DroneUploadService:
         os.makedirs(dataset_dir, exist_ok=True)
         
         safe_name = sanitize_filename(file.filename or "uploaded_file.tif")
+        ext = os.path.splitext(safe_name.lower())[1]
+        
+        if ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file format '{ext}'. Allowed formats: JPG, JPEG, PNG, TIFF, GeoTIFF, LAS, LAZ, ZIP."
+            )
+
         file_path = os.path.join(dataset_dir, safe_name)
         
         total_bytes = 0
@@ -51,10 +83,20 @@ class DroneUploadService:
                         pass
                     raise HTTPException(
                         status_code=413,
-                        detail=f"File exceeds maximum allowed size of 5 GB (Received: {total_bytes} bytes)."
+                        detail=f"File exceeds maximum allowed size of 5 GB (Received: {format_file_size(total_bytes)})."
                     )
                 await out_file.write(chunk)
                 
+        if total_bytes == 0:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes).")
+            
+        # Validate magic bytes
+        validate_magic_bytes(file_path, ext)
+        
         return {
             "dataset_id": dataset_id,
             "original_filename": file.filename or safe_name,

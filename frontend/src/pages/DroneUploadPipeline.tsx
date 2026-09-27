@@ -96,45 +96,7 @@ export const DroneUploadPipeline: React.FC<DroneUploadPipelineProps> = ({
       maxZoom: 20
     }).addTo(map);
 
-    // Flight boundary bounding box polygon (Tech District 14.2 sq.km)
-    const boundsPolygon: [number, number][] = [
-      [12.9750, 77.6350],
-      [12.9830, 77.6350],
-      [12.9830, 77.6460],
-      [12.9750, 77.6460]
-    ];
-
-    const poly = L.polygon(boundsPolygon, {
-      color: '#06b6d4',
-      weight: 2.5,
-      fillColor: '#0ea5e9',
-      fillOpacity: 0.25,
-      dashArray: '5, 5'
-    }).addTo(map);
-
-    poly.bindTooltip("Drone Survey Footprint: 14.2 sq.km (5cm GSD)", { permanent: true, direction: "center", className: "font-sans text-xs font-bold text-slate-800 bg-white/90 p-1.5 rounded shadow" });
-
-    // Flight path lines simulation
-    for (let lat = 12.9760; lat <= 12.9820; lat += 0.0015) {
-      L.polyline([[lat, 77.6355], [lat, 77.6455]], {
-        color: '#ffffff',
-        weight: 1.2,
-        opacity: 0.6,
-        dashArray: '4, 4'
-      }).addTo(map);
-    }
-
-    // CORS Benchmark pin
-    const corsMarker = L.circleMarker([12.9785, 77.6412], {
-      radius: 6,
-      fillColor: '#10b981',
-      color: '#ffffff',
-      weight: 2,
-      fillOpacity: 1
-    }).addTo(map);
-    corsMarker.bindTooltip("CORS RTK Checkpoint TN-04", { permanent: false });
-
-    map.fitBounds(poly.getBounds());
+    // Pure map without hardcoded demo coordinates
     previewMapInstance.current = map;
 
     return () => {

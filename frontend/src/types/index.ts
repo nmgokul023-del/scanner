@@ -21,23 +21,25 @@ export interface Parcel {
   id: string;
   parcel_id: string;
   title: string;
+  owner?: string;
   address: string;
   zone: string;
-  zone_description: string;
-  existing_area_sqm: number;
+  zone_description?: string;
+  existing_area_sqm?: number | null;
   ai_area_sqm: number;
-  difference_sqm: number;
-  confidence_score: number;
-  status: 'Verified' | 'Requires Verification' | 'Conflict Detected' | 'High Confidence' | 'Rejected';
-  current_status_tag: string;
-  valuation_usd: number;
-  valuation_change_pct: number;
-  suitability_score: number;
-  roi_potential: string;
-  risk_level: string;
-  description: string;
-  quote: string;
-  total_area_acres: number;
+  difference_sqm?: number | null;
+  confidence_score?: number | null;
+  status: string;
+  current_status_tag?: string;
+  valuation_usd?: number | string | null;
+  valuation_change_pct?: number | null;
+  suitability_score?: number | null;
+  roi_potential?: string;
+  risk_level?: string;
+  description?: string;
+  quote?: string;
+  total_area_acres?: number | null;
+  dataset_id?: string | null;
   geometry: {
     type: string;
     coordinates: number[][][] | any;
@@ -46,11 +48,11 @@ export interface Parcel {
     type: string;
     coordinates: number[][][] | any;
   };
-  land_composition: LandComposition;
-  environmental: EnvironmentalMetrics;
-  growth_predictions: GrowthPredictionPoint[];
-  history_events: { date: string; event: string }[];
-  documents: { name: string; type: string; size: string }[];
+  land_composition?: LandComposition;
+  environmental?: EnvironmentalMetrics;
+  growth_predictions?: GrowthPredictionPoint[];
+  history_events?: { date: string; event: string }[];
+  documents?: { name: string; type: string; size: string }[];
 }
 
 export interface Building {
@@ -58,11 +60,31 @@ export interface Building {
   parcel_id: string;
   footprint_area_sqm: number;
   height_meters: number;
-  confidence_score: number;
+  confidence_score?: number | null;
+  relationship?: 'Contains' | 'Intersects' | string;
+  intersection_area_sqm?: number;
   status: string;
   geometry: {
     type: string;
-    coordinates: number[][][];
+    coordinates: number[][][] | any;
+  };
+}
+
+export interface BuildingParcelLink {
+  building_id: string;
+  parcel_id: string;
+  relationship: 'Contains' | 'Intersects';
+  intersection_area_sqm: number;
+}
+
+export interface LandUseFeature {
+  id: string;
+  dataset_id?: string;
+  category: 'Vegetation' | 'Water' | 'Open Land' | 'Road' | 'Building';
+  area_sqm: number;
+  geometry: {
+    type: string;
+    coordinates: any;
   };
 }
 
@@ -71,10 +93,10 @@ export interface Road {
   name: string;
   road_type: string;
   width_meters: number;
-  confidence_score: number;
+  confidence_score?: number | null;
   geometry: {
     type: string;
-    coordinates: number[][];
+    coordinates: number[][] | any;
   };
 }
 
@@ -84,7 +106,7 @@ export interface Pathway {
   width_meters: number;
   geometry: {
     type: string;
-    coordinates: number[][];
+    coordinates: number[][] | any;
   };
 }
 
@@ -96,14 +118,14 @@ export interface Conflict {
   ai_area_sqm: number;
   difference_sqm: number;
   affected_area_sqm: number;
-  confidence_score: number;
-  status: 'Pending' | 'Requires Survey Verification' | 'Resolved' | 'Dismissed';
+  confidence_score?: number | null;
+  status: 'Pending' | 'Requires Survey Verification' | 'Resolved' | 'Dismissed' | string;
   recommendation: string;
-  severity: 'High' | 'Medium' | 'Low';
+  severity: 'High' | 'Medium' | 'Low' | string;
   notes?: string;
   geometry: {
     type: string;
-    coordinates: number[][][];
+    coordinates: number[][][] | any;
   };
 }
 

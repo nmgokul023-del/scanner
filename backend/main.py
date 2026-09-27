@@ -7,7 +7,7 @@ PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +37,21 @@ app.include_router(api_router, prefix="/api")
 
 # Serve Frontend static assets if built
 DIST_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
+
+# Downloadable built project zip endpoint
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+ZIP_FILE = os.path.join(PROJECT_ROOT, "UrbanCadastral_Build.zip")
+
+@app.get("/download-zip")
+@app.get("/api/download-zip")
+def download_zip():
+    if os.path.exists(ZIP_FILE):
+        return FileResponse(
+            ZIP_FILE,
+            media_type="application/zip",
+            filename="UrbanCadastral_Build.zip"
+        )
+    raise HTTPException(status_code=404, detail="Build zip file not found")
 
 if os.path.exists(DIST_DIR):
     app.mount("/assets", StaticFiles(directory=os.path.join(DIST_DIR, "assets")), name="assets")

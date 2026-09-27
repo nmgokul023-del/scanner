@@ -25,25 +25,36 @@ import {
 interface SidebarProps {
   currentRoute: string;
   onNavigate: (route: string) => void;
+  conflictsCount?: number;
+  confidenceCount?: number;
+  topologyPassRate?: number | null;
+  corsConnected?: boolean;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ currentRoute, onNavigate }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ 
+  currentRoute, 
+  onNavigate,
+  conflictsCount,
+  confidenceCount,
+  topologyPassRate,
+  corsConnected = false
+}) => {
   const sections = [
     {
       title: 'OVERVIEW & PIPELINE',
       items: [
         { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-        { id: 'insights', label: 'AI Insights (Preview)', icon: Sparkles, badge: 'Design' },
+        { id: 'insights', label: 'AI Insights (Preview)', icon: Sparkles },
         { id: 'projects', label: 'Cadastral Projects', icon: FolderKanban },
         { id: 'drone-imagery', label: 'Drone Imagery (ORI/DSM)', icon: Camera },
-        { id: 'ai-extraction', label: 'AI Feature Extraction', icon: Cpu, badge: 'Live AI' },
+        { id: 'ai-extraction', label: 'AI Feature Extraction', icon: Cpu },
       ]
     },
     {
       title: 'GIS CADASTRAL FEATURES',
       items: [
         { id: 'parcel-map', label: 'Cadastral Map & Parcels', icon: Map },
-        { id: 'property-details', label: 'Property Details (3D)', icon: Building, badge: 'Design' },
+        { id: 'property-details', label: 'Property Details (3D)', icon: Building },
         { id: 'buildings', label: 'Building Footprints', icon: Building2 },
         { id: 'roads', label: 'Roads & Rights-of-Way', icon: GitFork },
         { id: 'land-use', label: 'Land Use Classification', icon: PieChart },
@@ -52,17 +63,34 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentRoute, onNavigate }) =>
     {
       title: 'ANALYSIS & VERIFICATION',
       items: [
-        { id: 'conflicts', label: 'Boundary Conflicts', icon: AlertTriangle, count: 126, countColor: 'bg-rose-500 text-white' },
-        { id: 'confidence', label: 'Confidence Queue', icon: Award, count: 428, countColor: 'bg-amber-100 text-amber-800' },
+        { 
+          id: 'conflicts', 
+          label: 'Boundary Conflicts', 
+          icon: AlertTriangle, 
+          count: conflictsCount !== undefined && conflictsCount > 0 ? conflictsCount : undefined, 
+          countColor: 'bg-rose-500 text-white' 
+        },
+        { 
+          id: 'confidence', 
+          label: 'Confidence Queue', 
+          icon: Award, 
+          count: confidenceCount !== undefined && confidenceCount > 0 ? confidenceCount : undefined, 
+          countColor: 'bg-amber-100 text-amber-800' 
+        },
         { id: 'verification', label: 'Human Verification', icon: CheckSquare },
         { id: 'ground-truth', label: 'Ground Truth & CORS', icon: Navigation2 },
-        { id: 'change-detection', label: 'Change Detection (2026)', icon: Clock },
+        { id: 'change-detection', label: 'Change Detection', icon: Clock },
       ]
     },
     {
       title: 'GIS ENGINE & COMPLIANCE',
       items: [
-        { id: 'topology', label: 'Topology Validation', icon: CheckCircle, badge: '99.8%' },
+        { 
+          id: 'topology', 
+          label: 'Topology Validation', 
+          icon: CheckCircle, 
+          badge: topologyPassRate != null ? `${topologyPassRate}%` : undefined 
+        },
         { id: 'gis-editor', label: 'Vector GIS Editor', icon: FileSpreadsheet },
         { id: 'reports', label: 'Reports & GIS Export', icon: FileText },
         { id: 'audit', label: 'Audit Trail', icon: History },
@@ -126,9 +154,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentRoute, onNavigate }) =>
       <div className="p-3 bg-slate-950/60 border-t border-slate-800/80 text-[11px] text-slate-400">
         <div className="flex items-center justify-between font-mono">
           <span className="text-slate-500">CORS Real-Time:</span>
-          <span className="text-emerald-400 font-semibold flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span> Active (2cm)
-          </span>
+          {corsConnected ? (
+            <span className="text-emerald-400 font-semibold flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span> Active
+            </span>
+          ) : (
+            <span className="text-slate-500 font-semibold">Not Connected</span>
+          )}
         </div>
       </div>
     </aside>

@@ -99,25 +99,26 @@ export const Navbar: React.FC<NavbarProps> = ({
           <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-rose-500 ring-2 ring-white"></span>
         </button>
 
-        {/* User Pill */}
+        {/* User Pill & Logout */}
         <div className="flex items-center pl-2 border-l border-slate-200 space-x-2.5">
-          <div className="w-8 h-8 rounded-full bg-blue-100 border border-blue-200 text-blue-700 flex items-center justify-center font-bold text-xs">
-            RR
+          <div className="w-8 h-8 rounded-full bg-blue-100 border border-blue-200 text-blue-700 flex items-center justify-center font-bold text-xs uppercase">
+            {currentUser?.name ? currentUser.name.slice(0, 2).toUpperCase() : (currentUser?.email ? currentUser.email.slice(0, 2).toUpperCase() : 'SU')}
           </div>
           <div className="hidden sm:block text-left">
             <div className="text-xs font-semibold text-slate-900 leading-tight">
-              {currentUser?.name || 'R. Ramanathan'}
+              {currentUser?.name || currentUser?.email || 'Survey User'}
             </div>
             <div className="text-[10px] text-slate-500">
-              Chief Cadastral Surveyor
+              {currentUser?.role || 'Survey User'}
             </div>
           </div>
           <button 
             onClick={onLogout}
             title="Sign Out"
-            className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors"
+            className="p-1.5 text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors flex items-center gap-1 text-xs font-semibold cursor-pointer"
           >
             <LogOut className="w-4 h-4" />
+            <span className="hidden md:inline">Logout</span>
           </button>
         </div>
       </div>

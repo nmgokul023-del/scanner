@@ -25,14 +25,18 @@ export const ConfidenceQueue: React.FC<ConfidenceQueueProps> = ({
   const [sortField, setSortField] = useState<'confidence' | 'difference' | 'priority'>('confidence');
   const [filterTier, setFilterTier] = useState<'all' | 'high' | 'medium' | 'low'>('all');
 
+  const highParcels = parcels.filter(p => (p.confidence_score || 0) >= 0.90);
+  const mediumParcels = parcels.filter(p => (p.confidence_score || 0) >= 0.70 && (p.confidence_score || 0) < 0.90);
+  const lowParcels = parcels.filter(p => (p.confidence_score || 0) < 0.70);
+
   const sortedParcels = [...parcels].filter(p => {
-    if (filterTier === 'high') return p.confidence_score >= 0.90;
-    if (filterTier === 'medium') return p.confidence_score >= 0.70 && p.confidence_score < 0.90;
-    if (filterTier === 'low') return p.confidence_score < 0.70;
+    if (filterTier === 'high') return (p.confidence_score || 0) >= 0.90;
+    if (filterTier === 'medium') return (p.confidence_score || 0) >= 0.70 && (p.confidence_score || 0) < 0.90;
+    if (filterTier === 'low') return (p.confidence_score || 0) < 0.70;
     return true;
   }).sort((a, b) => {
-    if (sortField === 'confidence') return a.confidence_score - b.confidence_score;
-    if (sortField === 'difference') return Math.abs(b.difference_sqm) - Math.abs(a.difference_sqm);
+    if (sortField === 'confidence') return (a.confidence_score || 0) - (b.confidence_score || 0);
+    if (sortField === 'difference') return Math.abs(b.difference_sqm || 0) - Math.abs(a.difference_sqm || 0);
     if (sortField === 'priority') return (b.suitability_score || 0) - (a.suitability_score || 0);
     return 0;
   });
@@ -93,9 +97,13 @@ export const ConfidenceQueue: React.FC<ConfidenceQueueProps> = ({
         >
           <div className="flex justify-between items-center text-xs">
             <span className="font-bold text-emerald-700 uppercase">High Confidence (&gt;90%)</span>
-            <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-extrabold text-[10px]">10,847 Parcels</span>
+            <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-extrabold text-[10px]">
+              {highParcels.length} Parcels
+            </span>
           </div>
-          <div className="text-xl font-extrabold text-slate-900 mt-2">98% – 92%</div>
+          <div className="text-xl font-extrabold text-slate-900 mt-2">
+            {parcels.length > 0 ? `${Math.round((highParcels.length / parcels.length) * 100)}% of Total` : '0 Parcels'}
+          </div>
           <p className="text-[11px] text-slate-500 mt-1">Directly eligible for automated mutation without field resurvey.</p>
         </div>
 
@@ -107,9 +115,13 @@ export const ConfidenceQueue: React.FC<ConfidenceQueueProps> = ({
         >
           <div className="flex justify-between items-center text-xs">
             <span className="font-bold text-amber-700 uppercase">Medium Confidence (70-90%)</span>
-            <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 font-extrabold text-[10px]">1,211 Parcels</span>
+            <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 font-extrabold text-[10px]">
+              {mediumParcels.length} Parcels
+            </span>
           </div>
-          <div className="text-xl font-extrabold text-slate-900 mt-2">82% – 76%</div>
+          <div className="text-xl font-extrabold text-slate-900 mt-2">
+            {parcels.length > 0 ? `${Math.round((mediumParcels.length / parcels.length) * 100)}% of Total` : '0 Parcels'}
+          </div>
           <p className="text-[11px] text-slate-500 mt-1">Requires visual cross-check against orthophoto before endorsement.</p>
         </div>
 
@@ -121,9 +133,13 @@ export const ConfidenceQueue: React.FC<ConfidenceQueueProps> = ({
         >
           <div className="flex justify-between items-center text-xs">
             <span className="font-bold text-rose-700 uppercase">Low Confidence (&lt;70%)</span>
-            <span className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 font-extrabold text-[10px]">428 Parcels</span>
+            <span className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 font-extrabold text-[10px]">
+              {lowParcels.length} Parcels
+            </span>
           </div>
-          <div className="text-xl font-extrabold text-slate-900 mt-2">54% or below</div>
+          <div className="text-xl font-extrabold text-slate-900 mt-2">
+            {parcels.length > 0 ? `${Math.round((lowParcels.length / parcels.length) * 100)}% of Total` : '0 Parcels'}
+          </div>
           <p className="text-[11px] text-slate-500 mt-1">Automatic DGPS/CORS field survey assignment dispatched.</p>
         </div>
       </div>
@@ -145,7 +161,11 @@ export const ConfidenceQueue: React.FC<ConfidenceQueueProps> = ({
         </div>
 
         <div className="divide-y divide-slate-100">
-          {sortedParcels.map((p) => (
+          {sortedParcels.length === 0 ? (
+            <div className="p-8 text-center text-slate-500 text-xs">
+              No parcels available in the review queue. Upload drone imagery or extract parcels to populate.
+            </div>
+          ) : sortedParcels.map((p) => (
             <div
               key={p.id}
               className="p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-slate-50 transition-colors"

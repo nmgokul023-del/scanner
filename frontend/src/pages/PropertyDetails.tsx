@@ -84,7 +84,7 @@ export const PropertyDetails: React.FC<PropertyDetailsProps> = ({
           </div>
           <div className="text-xs font-bold text-slate-900 flex items-center gap-1">
             <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-            {parcel.current_status_tag || 'Development Ready'}
+            {parcel.current_status_tag || parcel.status || 'Human Review Required'}
           </div>
         </div>
 
@@ -102,7 +102,7 @@ export const PropertyDetails: React.FC<PropertyDetailsProps> = ({
         {/* AI Score Circular Pill (Left side) */}
         <div className="absolute top-28 left-4 w-16 h-16 rounded-full bg-white/95 backdrop-blur-md border-2 border-blue-500 shadow-xl flex flex-col items-center justify-center">
           <span className="text-xl font-extrabold text-blue-600 leading-none">
-            {parcel.suitability_score || 94}
+            {parcel.suitability_score != null ? parcel.suitability_score : 'N/A'}
           </span>
           <span className="text-[8px] font-bold text-slate-400 uppercase tracking-tighter">
             AI SCORE
@@ -213,13 +213,13 @@ export const PropertyDetails: React.FC<PropertyDetailsProps> = ({
             {/* Header info */}
             <div>
               <div className="text-xs font-extrabold text-blue-600 uppercase tracking-widest mb-1">
-                {parcel.title || 'PARCEL #8824-A • ZONE M-2'}
+                {parcel.title || (parcel.parcel_id ? `PARCEL #${parcel.parcel_id}` : 'Cadastral Parcel')}
               </div>
               <h2 className="text-2xl font-extrabold text-slate-900 tracking-tight">
-                {parcel.address || '1242 Innovation Way'}
+                {parcel.address || 'Address Not Available'}
               </h2>
               <p className="text-xs text-slate-600 font-medium mt-2 leading-relaxed">
-                {parcel.description || 'Prime urban development lot located in the heart of the Tech District. High-density potential with approved AI-optimized zoning variances.'}
+                {parcel.description || 'Cadastral parcel record extracted from drone imagery.'}
               </p>
             </div>
 
@@ -229,16 +229,16 @@ export const PropertyDetails: React.FC<PropertyDetailsProps> = ({
                 <span className="text-xs font-bold text-slate-700">AI Optimization Score</span>
                 <div className="flex items-center space-x-2">
                   <span className="text-[10px] font-extrabold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                    ROI POTENTIAL {parcel.roi_potential || 'EXCELLENT'}
+                    STATUS {parcel.status || 'REVIEW'}
                   </span>
                   <span className="text-[10px] font-extrabold px-2 py-0.5 rounded bg-blue-100 text-blue-800">
-                    RISK LEVEL {parcel.risk_level || 'LOW'}
+                    CONFIDENCE {parcel.confidence_score != null ? `${Math.round(parcel.confidence_score * 100)}%` : 'N/A'}
                   </span>
                 </div>
               </div>
 
               <blockquote className="text-xs italic text-slate-600 border-l-2 border-blue-500 pl-3 py-0.5 font-medium">
-                {parcel.quote || '"This parcel is 15% undervalued compared to similar Tech District developments." — AI Insights'}
+                {parcel.quote || 'Cadastral boundary record pending human review.'}
               </blockquote>
             </div>
 
@@ -284,9 +284,9 @@ export const PropertyDetails: React.FC<PropertyDetailsProps> = ({
             </div>
             <div className="p-4 rounded-xl border border-slate-200 text-xs text-slate-600 space-y-2">
               <div className="font-semibold text-slate-800">Drone Feature Breakdown:</div>
-              <p>• Drone Orthomosaic resolution: 5cm GSD captured on 2026-08-15.</p>
-              <p>• Building boundary extraction: ResNet-50 UNet with 96% IoU confidence.</p>
-              <p>• Compound wall detection aligns with RTK GNSS benchmark TN-04.</p>
+              <p>• Boundary Confidence: {parcel.confidence_score != null ? `${Math.round(parcel.confidence_score * 100)}%` : 'Not Available'}</p>
+              <p>• Verification Status: {parcel.status || 'Human Review Required'}</p>
+              <p>• Cadastral Zone: {parcel.zone || 'Not Available'}</p>
             </div>
           </div>
         )}

@@ -1,31 +1,50 @@
 import React, { useState } from 'react';
-import { MapPin, Mail, Lock, Building2, ArrowRight, AlertCircle } from 'lucide-react';
+import { MapPin, AlertCircle, Eye, EyeOff, RefreshCw } from 'lucide-react';
 import { apiClient } from '../api/client';
 
 interface LoginProps {
-  onLoginSuccess: (user: any) => void;
+  onLoginSuccess: (user: any, token: string) => void;
 }
 
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
-  const [email, setEmail] = useState('agent@urbancadastral.ai');
-  const [password, setPassword] = useState('cadastre2026');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true);
     setErrorMessage(null);
+
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail || !EMAIL_REGEX.test(trimmedEmail) || !password) {
+      setErrorMessage('Enter a valid email and password.');
+      return;
+    }
+
+    setLoading(true);
     try {
-      const res = await apiClient.login(email, password);
-      if (res && res.user && res.token) {
-        onLoginSuccess(res.user);
+      const res = await apiClient.login(trimmedEmail, password);
+      if (res && res.success && res.token && res.user) {
+        localStorage.setItem('cadastral_auth_token', res.token);
+        localStorage.setItem('cadastral_auth_user', JSON.stringify(res.user));
+        onLoginSuccess(res.user, res.token);
       } else {
-        setErrorMessage('Invalid email or password');
+        setErrorMessage(res?.message || 'Enter a valid email and password.');
       }
     } catch (err: any) {
-      setErrorMessage(err.detail || err.message || 'Invalid email or password');
+      if (
+        err.detail === 'Unable to connect to authentication server.' || 
+        err.message === 'Unable to connect to authentication server.'
+      ) {
+        setErrorMessage('Unable to connect to authentication server.');
+      } else {
+        setErrorMessage(err.detail || err.message || 'Enter a valid email and password.');
+      }
     } finally {
       setLoading(false);
     }
@@ -36,13 +55,22 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
     setErrorMessage(null);
     try {
       const res = await apiClient.loginGoogle();
-      if (res && res.user && res.token) {
-        onLoginSuccess(res.user);
+      if (res && res.token && res.user) {
+        localStorage.setItem('cadastral_auth_token', res.token);
+        localStorage.setItem('cadastral_auth_user', JSON.stringify(res.user));
+        onLoginSuccess(res.user, res.token);
       } else {
         setErrorMessage('Google authentication failed.');
       }
     } catch (err: any) {
-      setErrorMessage(err.detail || err.message || 'Google authentication failed.');
+      if (
+        err.detail === 'Unable to connect to authentication server.' || 
+        err.message === 'Unable to connect to authentication server.'
+      ) {
+        setErrorMessage('Unable to connect to authentication server.');
+      } else {
+        setErrorMessage(err.detail || err.message || 'Google authentication failed.');
+      }
     } finally {
       setLoading(false);
     }
@@ -74,7 +102,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             <button
               type="button"
               onClick={() => setErrorMessage(null)}
-              className="text-rose-500 hover:text-rose-800 ml-2 font-bold"
+              className="text-rose-500 hover:text-rose-800 ml-2 font-bold cursor-pointer"
             >
               ✕
             </button>
@@ -85,7 +113,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
         {infoMessage && (
           <div className="w-full mb-4 p-3 bg-blue-50 border border-blue-200 text-blue-800 text-xs font-semibold rounded-xl flex items-center justify-between animate-in fade-in">
             <span>{infoMessage}</span>
-            <button onClick={() => setInfoMessage(null)} className="text-blue-500 hover:text-blue-800 ml-2">✕</button>
+            <button onClick={() => setInfoMessage(null)} className="text-blue-500 hover:text-blue-800 ml-2 cursor-pointer">✕</button>
           </div>
         )}
 
@@ -102,13 +130,13 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
-                placeholder="agent@urbancadastral.ai"
+                placeholder="user@example.com"
                 className="w-full px-3.5 py-3 rounded-xl border border-slate-200 bg-white text-slate-800 text-sm font-medium shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all placeholder:text-slate-300"
               />
             </div>
           </div>
 
-          {/* Password with Forgot */}
+          {/* Password with Forgot & Show/Hide */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
@@ -117,19 +145,28 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
               <button
                 type="button"
                 onClick={() => setInfoMessage('Password reset link sent to registered institutional email.')}
-                className="text-[11px] font-bold text-blue-600 uppercase hover:underline tracking-wider"
+                className="text-[11px] font-bold text-blue-600 uppercase hover:underline tracking-wider cursor-pointer"
               >
                 FORGOT?
               </button>
             </div>
             <div className="relative">
               <input
-                type="password"
+                type={showPassword ? 'text' : 'password'}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
-                className="w-full px-3.5 py-3 rounded-xl border border-slate-200 bg-white text-slate-800 text-sm font-medium shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
+                placeholder="Enter your password"
+                className="w-full pl-3.5 pr-10 py-3 rounded-xl border border-slate-200 bg-white text-slate-800 text-sm font-medium shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all placeholder:text-slate-300"
               />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 focus:outline-none p-1 cursor-pointer"
+                title={showPassword ? 'Hide password' : 'Show password'}
+              >
+                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
             </div>
           </div>
 
@@ -138,9 +175,16 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             <button
               type="submit"
               disabled={loading}
-              className="w-full py-3.5 px-4 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl shadow-md shadow-blue-500/25 transition-all flex items-center justify-center space-x-2 active:scale-[0.99]"
+              className="w-full py-3.5 px-4 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl shadow-md shadow-blue-500/25 transition-all flex items-center justify-center space-x-2 active:scale-[0.99] disabled:opacity-60 cursor-pointer"
             >
-              <span>{loading ? 'Authenticating...' : 'Sign In'}</span>
+              {loading ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin mr-2" />
+                  <span>Authenticating...</span>
+                </>
+              ) : (
+                <span>Sign In</span>
+              )}
             </button>
           </div>
         </form>
@@ -157,7 +201,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
           type="button"
           onClick={handleGoogleSignIn}
           disabled={loading}
-          className="w-full py-3 px-4 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-medium rounded-xl shadow-sm transition-all flex items-center justify-center space-x-3 active:scale-[0.99] disabled:opacity-60"
+          className="w-full py-3 px-4 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-medium rounded-xl shadow-sm transition-all flex items-center justify-center space-x-3 active:scale-[0.99] disabled:opacity-60 cursor-pointer"
         >
           <svg className="w-5 h-5" viewBox="0 0 24 24">
             <path
@@ -185,7 +229,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
           <span>Don't have an account? </span>
           <button
             onClick={() => setInfoMessage('Access request submitted for institutional cadastre deployment review.')}
-            className="font-bold text-blue-600 hover:underline"
+            className="font-bold text-blue-600 hover:underline cursor-pointer"
           >
             Request Access
           </button>

@@ -109,7 +109,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
       id: 'high-confidence',
       label: 'High Confidence',
       value: stats?.high_confidence !== undefined ? String(stats.high_confidence) : '0',
-      sub: '> 90% AI Accuracy',
+      sub: 'AI Conf. ≥ 0.85',
       icon: Award,
       color: 'text-emerald-600',
       bg: 'bg-emerald-50',
@@ -127,6 +127,29 @@ export const Dashboard: React.FC<DashboardProps> = ({
     }
   ];
 
+  // Dynamic calculations from actual parcels and conflicts
+  const totalParcelsCount = parcels.length;
+  const verifiedCount = parcels.filter(p => p.status === 'Verified' || p.status === 'Human-verified').length;
+  const highConfCount = parcels.filter(p => (p.confidence_score || 0) >= 0.85 || p.status === 'High Confidence').length;
+  const reviewCount = parcels.filter(p => p.status === 'Requires Verification' || ((p.confidence_score || 0) >= 0.7 && (p.confidence_score || 0) < 0.85)).length;
+  const conflictsCount = conflicts.length;
+
+  const verifiedPct = totalParcelsCount > 0 ? Math.round((verifiedCount / totalParcelsCount) * 100) : 0;
+  const highConfPct = totalParcelsCount > 0 ? Math.round((highConfCount / totalParcelsCount) * 100) : 0;
+  const reviewPct = totalParcelsCount > 0 ? Math.round((reviewCount / totalParcelsCount) * 100) : 0;
+  const conflictsPct = totalParcelsCount > 0 ? Math.min(100, Math.round((conflictsCount / totalParcelsCount) * 100)) : 0;
+
+  // AI Confidence buckets
+  const confHigh = parcels.filter(p => (p.confidence_score || 0) >= 0.85).length;
+  const confMed = parcels.filter(p => (p.confidence_score || 0) >= 0.70 && (p.confidence_score || 0) < 0.85).length;
+  const confLow = parcels.filter(p => (p.confidence_score || 0) < 0.70).length;
+
+  // Land-use averages from loaded parcels
+  const parcelsWithComp = parcels.filter(p => p.land_composition);
+  const avgBuildable = parcelsWithComp.length > 0 ? Math.round(parcelsWithComp.reduce((acc, p) => acc + (p.land_composition.buildable_area_pct || 0), 0) / parcelsWithComp.length) : 0;
+  const avgGreen = parcelsWithComp.length > 0 ? Math.round(parcelsWithComp.reduce((acc, p) => acc + (p.land_composition.green_space_pct || 0), 0) / parcelsWithComp.length) : 0;
+  const avgRoads = parcelsWithComp.length > 0 ? Math.round(parcelsWithComp.reduce((acc, p) => acc + (p.land_composition.paved_roads_pct || 0), 0) / parcelsWithComp.length) : 0;
+  const avgWater = parcelsWithComp.length > 0 ? Math.round(parcelsWithComp.reduce((acc, p) => acc + (p.land_composition.water_retention_pct || 0), 0) / parcelsWithComp.length) : 0;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6 select-none pb-24 md:pb-12">
@@ -135,7 +158,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         <div className="space-y-2 max-w-2xl">
           <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/15 backdrop-blur-md text-xs font-semibold text-blue-100">
             <Sparkles className="w-3.5 h-3.5 text-blue-200" />
-            <span>AI Cadastral Pipeline Active • 5cm Drone Orthomosaic</span>
+            <span>AI Cadastral Pipeline Active • Neural Inference</span>
           </div>
           <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
             UrbanCadastral AI Operations
@@ -198,7 +221,11 @@ export const Dashboard: React.FC<DashboardProps> = ({
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-sm font-bold text-slate-900 tracking-tight">Cadastral Verification Progress</h2>
-              <p className="text-xs text-slate-500 font-medium">8,624 of 12,486 parcels verified with Ground Truth / CORS</p>
+              <p className="text-xs text-slate-500 font-medium">
+                {totalParcelsCount > 0 
+                  ? `${verifiedCount.toLocaleString()} of ${totalParcelsCount.toLocaleString()} parcels verified with Ground Truth / Survey`
+                  : 'No cadastral records currently loaded'}
+              </p>
             </div>
             <button 
               onClick={() => onNavigate('verification')}
@@ -211,23 +238,23 @@ export const Dashboard: React.FC<DashboardProps> = ({
           {/* Progress bar */}
           <div className="space-y-2">
             <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden flex">
-              <div className="h-full bg-emerald-500" style={{ width: '69%' }} title="GT Verified: 69%" />
-              <div className="h-full bg-blue-500" style={{ width: '18%' }} title="High Confidence AI: 18%" />
-              <div className="h-full bg-amber-400" style={{ width: '10%' }} title="Requires Review: 10%" />
-              <div className="h-full bg-rose-500" style={{ width: '3%' }} title="Conflicts: 3%" />
+              <div className="h-full bg-emerald-500" style={{ width: `${verifiedPct}%` }} title={`GT Verified: ${verifiedPct}%`} />
+              <div className="h-full bg-blue-500" style={{ width: `${highConfPct}%` }} title={`High Confidence AI: ${highConfPct}%`} />
+              <div className="h-full bg-amber-400" style={{ width: `${reviewPct}%` }} title={`Requires Review: ${reviewPct}%`} />
+              <div className="h-full bg-rose-500" style={{ width: `${conflictsPct}%` }} title={`Conflicts: ${conflictsPct}%`} />
             </div>
             <div className="flex flex-wrap items-center justify-between text-[11px] text-slate-500 font-medium pt-1">
               <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-sm bg-emerald-500"></span> Verified (69%)
+                <span className="w-2.5 h-2.5 rounded-sm bg-emerald-500"></span> Verified ({verifiedPct}%)
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-sm bg-blue-500"></span> AI High Conf (18%)
+                <span className="w-2.5 h-2.5 rounded-sm bg-blue-500"></span> AI High Conf ({highConfPct}%)
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-sm bg-amber-400"></span> In Review (10%)
+                <span className="w-2.5 h-2.5 rounded-sm bg-amber-400"></span> In Review ({reviewPct}%)
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-sm bg-rose-500"></span> Conflicts (3%)
+                <span className="w-2.5 h-2.5 rounded-sm bg-rose-500"></span> Conflicts ({conflictsPct}%)
               </span>
             </div>
           </div>
@@ -237,18 +264,18 @@ export const Dashboard: React.FC<DashboardProps> = ({
             <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">AI Confidence Distribution</h3>
             <div className="grid grid-cols-3 gap-3 text-center">
               <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                <div className="text-[10px] font-bold text-emerald-600 uppercase">High (&gt;90%)</div>
-                <div className="text-lg font-bold text-slate-900 mt-0.5">10,847</div>
+                <div className="text-[10px] font-bold text-emerald-600 uppercase">High (≥ 85%)</div>
+                <div className="text-lg font-bold text-slate-900 mt-0.5">{confHigh.toLocaleString()}</div>
                 <div className="text-[10px] text-slate-400">Auto-validatable</div>
               </div>
               <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                <div className="text-[10px] font-bold text-amber-600 uppercase">Medium (70-90%)</div>
-                <div className="text-lg font-bold text-slate-900 mt-0.5">1,211</div>
+                <div className="text-[10px] font-bold text-amber-600 uppercase">Medium (70-85%)</div>
+                <div className="text-lg font-bold text-slate-900 mt-0.5">{confMed.toLocaleString()}</div>
                 <div className="text-[10px] text-slate-400">Analyst review</div>
               </div>
               <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                <div className="text-[10px] font-bold text-rose-600 uppercase">Low (&lt;70%)</div>
-                <div className="text-lg font-bold text-slate-900 mt-0.5">428</div>
+                <div className="text-[10px] font-bold text-rose-600 uppercase">Low (&lt; 70%)</div>
+                <div className="text-lg font-bold text-slate-900 mt-0.5">{confLow.toLocaleString()}</div>
                 <div className="text-[10px] text-slate-400">Field GNSS required</div>
               </div>
             </div>
@@ -262,50 +289,56 @@ export const Dashboard: React.FC<DashboardProps> = ({
             <PieChartIcon className="w-4 h-4 text-slate-400" />
           </div>
 
-          <div className="space-y-3 text-xs">
-            <div>
-              <div className="flex justify-between font-semibold text-slate-700 mb-1">
-                <span>Buildable Area (Residential/Commercial)</span>
-                <span>48%</span>
+          {parcelsWithComp.length > 0 ? (
+            <div className="space-y-3 text-xs">
+              <div>
+                <div className="flex justify-between font-semibold text-slate-700 mb-1">
+                  <span>Buildable Area (Residential/Commercial)</span>
+                  <span>{avgBuildable}%</span>
+                </div>
+                <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-full bg-blue-600 rounded-full" style={{ width: `${avgBuildable}%` }} />
+                </div>
               </div>
-              <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div className="h-full bg-blue-600 rounded-full" style={{ width: '48%' }} />
-              </div>
-            </div>
 
-            <div>
-              <div className="flex justify-between font-semibold text-slate-700 mb-1">
-                <span>Green Space & Urban Tree Canopy</span>
-                <span>22%</span>
+              <div>
+                <div className="flex justify-between font-semibold text-slate-700 mb-1">
+                  <span>Green Space & Urban Tree Canopy</span>
+                  <span>{avgGreen}%</span>
+                </div>
+                <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${avgGreen}%` }} />
+                </div>
               </div>
-              <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div className="h-full bg-emerald-500 rounded-full" style={{ width: '22%' }} />
-              </div>
-            </div>
 
-            <div>
-              <div className="flex justify-between font-semibold text-slate-700 mb-1">
-                <span>Paved Roads & Infrastructure</span>
-                <span>18%</span>
+              <div>
+                <div className="flex justify-between font-semibold text-slate-700 mb-1">
+                  <span>Paved Roads & Infrastructure</span>
+                  <span>{avgRoads}%</span>
+                </div>
+                <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-full bg-amber-500 rounded-full" style={{ width: `${avgRoads}%` }} />
+                </div>
               </div>
-              <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div className="h-full bg-amber-500 rounded-full" style={{ width: '18%' }} />
-              </div>
-            </div>
 
-            <div>
-              <div className="flex justify-between font-semibold text-slate-700 mb-1">
-                <span>Water Retention & Wetlands</span>
-                <span>12%</span>
-              </div>
-              <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
-                <div className="h-full bg-rose-500 rounded-full" style={{ width: '12%' }} />
+              <div>
+                <div className="flex justify-between font-semibold text-slate-700 mb-1">
+                  <span>Water Retention & Wetlands</span>
+                  <span>{avgWater}%</span>
+                </div>
+                <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-full bg-rose-500 rounded-full" style={{ width: `${avgWater}%` }} />
+                </div>
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 text-center">
+              Land-use composition metrics not available for current parcel selection.
+            </div>
+          )}
 
           <div className="p-3 bg-blue-50/60 rounded-xl border border-blue-100 text-[11px] text-blue-900">
-            <strong>AI Observation:</strong> Tech District exhibits 14% higher mixed-use conversion density compared to traditional cadastre records.
+            <strong>Cadastral Note:</strong> Metrics reflect active database records and neural drone segmentation.
           </div>
         </div>
       </div>

@@ -2,30 +2,21 @@ import uuid
 import os
 import re
 import json
+import math
 import asyncio
 import aiofiles
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query, Response, UploadFile, File, Form, Request, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from typing import List, Optional, Dict, Any
 
-from backend.data.mock_db import (
-    MOCK_PROJECTS,
-    MOCK_PARCELS,
-    MOCK_BUILDINGS,
-    MOCK_ROADS,
-    MOCK_PATHWAYS,
-    MOCK_CONFLICTS,
-    MOCK_GROUND_TRUTH_TASKS,
-    MOCK_CHANGE_DETECTION,
-    MOCK_TOPOLOGY_ISSUES,
-    MOCK_AUDIT_LOGS
-)
+
 from backend.services.parcel_extraction import ParcelExtractionService
 from backend.services.conflict_service import ConflictDetectionService
 from backend.services.topology_service import TopologyValidationService
 from backend.services.report_service import ReportService
 from backend.services.ai_extraction_service import AIExtractionService
+from backend.services.ai_model_interface import SegmentationModel
 from backend.services.db_service import DatabaseService, get_db_connection
 
 GROUND_TRUTH_UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "uploads", "ground_truth")
@@ -82,21 +73,22 @@ def api_root():
             "conflicts": "/api/conflicts",
             "geojson": "/api/gis/geojson",
             "drone_imagery": "/api/drone-imagery",
+            "datasets": "/api/datasets",
             "ground_truth": "/api/ground-truth",
             "audit": "/api/audit"
         }
     }
 
 # Global state in memory for live session fallback
-parcels_db = list(MOCK_PARCELS)
-buildings_db = list(MOCK_BUILDINGS)
-roads_db = list(MOCK_ROADS)
-pathways_db = list(MOCK_PATHWAYS)
-conflicts_db = list(MOCK_CONFLICTS)
-ground_truth_db = list(MOCK_GROUND_TRUTH_TASKS)
-changes_db = list(MOCK_CHANGE_DETECTION)
-topology_db = list(MOCK_TOPOLOGY_ISSUES)
-audit_db = list(MOCK_AUDIT_LOGS)
+parcels_db: List[Dict[str, Any]] = []
+buildings_db: List[Dict[str, Any]] = []
+roads_db: List[Dict[str, Any]] = []
+pathways_db: List[Dict[str, Any]] = []
+conflicts_db: List[Dict[str, Any]] = []
+ground_truth_db: List[Dict[str, Any]] = []
+changes_db: List[Dict[str, Any]] = []
+topology_db: List[Dict[str, Any]] = []
+audit_db: List[Dict[str, Any]] = []
 jobs_db: Dict[str, Any] = {}
 
 def add_audit_log(user: str, action: str, parcel_id: str, prev: str, new_val: str, details: str):
@@ -104,37 +96,129 @@ def add_audit_log(user: str, action: str, parcel_id: str, prev: str, new_val: st
     audit_db.insert(0, entry)
     return entry
 
-# AUTH
+# SESSIONS & AUTH
+ACTIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
 @router.post("/auth/login")
 def login(payload: Dict[str, Any]):
-    email = payload.get("email", "").strip()
+    email = payload.get("email")
     password = payload.get("password")
     
-    if not email or not password:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
+    # 1. Validate email format
+    # 2. Require password length >= 1
+    # 3. Accept any valid email + non-empty password
+    if (
+        not email or 
+        not isinstance(email, str) or 
+        not EMAIL_REGEX.match(email.strip()) or 
+        password is None or 
+        not isinstance(password, str) or 
+        len(password) < 1
+    ):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "success": False,
+                "message": "Enter a valid email and password."
+            }
         )
     
-    user = DatabaseService.authenticate_user(email, password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
-        )
+    email_clean = email.strip().lower()
     
-    token = f"cadastral-ai-jwt-{uuid.uuid4().hex}"
+    # Check if user already exists in DB
+    existing_user = DatabaseService.get_user_by_email(email_clean)
+    if existing_user:
+        user_name = existing_user.get("name") or email_clean.split("@")[0].replace(".", " ").title()
+        user_role = existing_user.get("role") or "Survey User"
+        user_id = existing_user.get("id") or f"usr-{uuid.uuid4().hex[:8]}"
+    else:
+        user_name = email_clean.split("@")[0].replace(".", " ").title()
+        user_role = "Survey User"
+        user_id = f"usr-{uuid.uuid4().hex[:8]}"
+        
+    token = f"cadastral-session-{uuid.uuid4().hex}"
+    user_data = {
+        "id": user_id,
+        "email": email_clean,
+        "name": user_name,
+        "role": user_role
+    }
+    
+    # Store session server-side
+    ACTIVE_SESSIONS[token] = {
+        "token": token,
+        "user": user_data,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    
     add_audit_log(
-        user["name"],
+        user_name,
         "User Login",
-        user["id"],
+        user_id,
         "Unauthenticated",
         "Authenticated",
-        f"Surveyor {user['name']} logged in successfully."
+        f"Survey User {user_name} ({email_clean}) logged in successfully."
     )
+    
+    # IMPORTANT: Never return the password, never print/log the password in logs
     return {
+        "success": True,
         "token": token,
-        "user": user
+        "user": user_data
+    }
+
+@router.get("/auth/session")
+@router.get("/auth/me")
+def get_session(request: Request):
+    auth_header = request.headers.get("Authorization", "")
+    token = ""
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    elif "x-auth-token" in request.headers:
+        token = request.headers.get("x-auth-token", "").strip()
+    elif "token" in request.query_params:
+        token = request.query_params.get("token", "").strip()
+        
+    if token and token in ACTIVE_SESSIONS:
+        session = ACTIVE_SESSIONS[token]
+        return {
+            "success": True,
+            "token": token,
+            "user": session["user"]
+        }
+    
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"success": False, "message": "No active session found"}
+    )
+
+@router.post("/auth/logout")
+def logout(request: Request, payload: Optional[Dict[str, Any]] = None):
+    auth_header = request.headers.get("Authorization", "")
+    token = ""
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    elif "x-auth-token" in request.headers:
+        token = request.headers.get("x-auth-token", "").strip()
+    elif payload and isinstance(payload, dict) and "token" in payload:
+        token = payload.get("token", "")
+        
+    if token in ACTIVE_SESSIONS:
+        del ACTIVE_SESSIONS[token]
+        
+    return {
+        "success": True,
+        "message": "Logged out successfully"
+    }
+
+@router.get("/auth/health")
+def auth_health():
+    return {
+        "status": "healthy",
+        "service": "UrbanCadastral Authentication API",
+        "active_sessions": len(ACTIVE_SESSIONS),
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 @router.post("/auth/google")
@@ -160,47 +244,55 @@ def google_login():
     }
 
 
+PROJECTS_STORE: List[Dict[str, Any]] = []
+
 # PROJECTS
 @router.get("/projects")
 def get_projects():
-    return MOCK_PROJECTS
+    datasets = DatabaseService.get_datasets()
+    dynamic_projects = []
+    for d in datasets:
+        dynamic_projects.append({
+            "id": f"proj-{d['id']}",
+            "name": d["name"],
+            "location": d.get("crs") or "Cadastral Survey Area",
+            "parcelsCount": 0,
+            "crs": d.get("crs") or "EPSG:4326",
+            "gsd": f"{d.get('gsd_cm', 0):.2f} cm" if d.get('gsd_cm') else "N/A",
+            "accuracy": "DGPS/CORS",
+            "status": "Active" if d.get("is_processed") else "Uploaded",
+            "created": d.get("created_at", "")
+        })
+    return dynamic_projects + PROJECTS_STORE
 
 @router.post("/projects")
 def create_project(project: Dict[str, Any]):
     project["id"] = f"proj-{uuid.uuid4().hex[:4]}"
-    MOCK_PROJECTS.append(project)
+    PROJECTS_STORE.append(project)
     add_audit_log("Admin", "Created Project", project["id"], "None", project.get("name", ""), "New project workspace registered.")
     return project
 
 # DASHBOARD STATISTICS
 @router.get("/dashboard/statistics")
-def get_dashboard_statistics():
-    return DatabaseService.get_dashboard_statistics()
+def get_dashboard_statistics(mode: str = Query("real", enum=["real", "demo", "all"])):
+    return DatabaseService.get_dashboard_statistics(mode=mode)
 
 # PARCELS
 @router.get("/parcels")
-def get_parcels(search: Optional[str] = None, zone: Optional[str] = None, status: Optional[str] = None):
-    db_parcels = DatabaseService.get_parcels(search, zone, status)
-    if db_parcels is not None:
-        return db_parcels
-    results = parcels_db
-    if search:
-        s = search.lower()
-        results = [p for p in results if s in p.get("parcel_id", "").lower() or s in p.get("address", "").lower() or s in p.get("title", "").lower()]
-    if zone:
-        results = [p for p in results if p.get("zone") == zone]
-    if status:
-        results = [p for p in results if p.get("status") == status]
-    return results
+def get_parcels(
+    search: Optional[str] = None,
+    zone: Optional[str] = None,
+    status: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    mode: str = Query("real", enum=["real", "demo", "all"])
+):
+    return DatabaseService.get_parcels(search=search, zone=zone, status=status, dataset_id=dataset_id, mode=mode) or []
 
 @router.get("/parcels/{parcel_id}")
 def get_parcel(parcel_id: str):
     p = DatabaseService.get_parcel_by_id(parcel_id)
     if p:
         return p
-    for p in parcels_db:
-        if p["id"] == parcel_id or p["parcel_id"] == parcel_id:
-            return p
     raise HTTPException(status_code=404, detail="Parcel not found")
 
 @router.put("/parcels/{parcel_id}")
@@ -208,13 +300,6 @@ def update_parcel(parcel_id: str, update_data: Dict[str, Any]):
     prev = DatabaseService.get_parcel_by_id(parcel_id)
     prev_status = prev.get("status", "") if prev else ""
     updated = DatabaseService.update_parcel(parcel_id, update_data)
-    if not updated:
-        # Fallback to in-memory parcels_db if not in sqlite
-        for i, p in enumerate(parcels_db):
-            if p["id"] == parcel_id or p["parcel_id"] == parcel_id:
-                parcels_db[i].update(update_data)
-                updated = parcels_db[i]
-                break
     if not updated:
         raise HTTPException(status_code=404, detail="Parcel not found")
 
@@ -229,18 +314,136 @@ def update_parcel(parcel_id: str, update_data: Dict[str, Any]):
     )
     return updated
 
+@router.post("/parcels")
+def create_parcel(payload: Dict[str, Any]):
+    new_p = DatabaseService.create_parcel(payload)
+    if not new_p:
+        raise HTTPException(status_code=400, detail="Failed to create parcel polygon.")
+    add_audit_log(
+        "Surveyor R. Ramanathan",
+        "Created Parcel Polygon",
+        new_p["parcel_id"],
+        "None",
+        new_p["status"],
+        f"Created parcel polygon in GIS Editor (Area: {new_p['ai_area_sqm']} m²)."
+    )
+    return new_p
+
+@router.delete("/parcels/{parcel_id}")
+def delete_parcel(parcel_id: str):
+    p = DatabaseService.get_parcel_by_id(parcel_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Parcel not found")
+    DatabaseService.delete_parcel(parcel_id)
+    add_audit_log(
+        "Surveyor R. Ramanathan",
+        "Deleted Parcel Polygon",
+        p["parcel_id"],
+        p["status"],
+        "Deleted",
+        f"Deleted parcel polygon {p['parcel_id']} from GIS Editor."
+    )
+    return {"success": True, "deleted_id": parcel_id}
+
+@router.post("/parcels/merge")
+def merge_parcels(payload: Dict[str, Any]):
+    pids = payload.get("parcel_ids", [])
+    if len(pids) < 2:
+        raise HTTPException(status_code=400, detail="At least two parcel IDs required for merging.")
+    p1 = DatabaseService.get_parcel_by_id(pids[0])
+    p2 = DatabaseService.get_parcel_by_id(pids[1])
+    if not p1 or not p2:
+        raise HTTPException(status_code=404, detail="One or more parcels not found for merging.")
+    
+    merged_geom = TopologyValidationService.merge_parcels(p1["geometry"], p2["geometry"])
+    if not merged_geom:
+        raise HTTPException(status_code=400, detail="Failed to merge parcel geometries topologically.")
+    
+    merged_area = TopologyValidationService.calculate_polygon_area_sqm(merged_geom)
+    DatabaseService.update_parcel(p1["id"], {
+        "geometry": merged_geom,
+        "ai_area_sqm": merged_area,
+        "existing_area_sqm": merged_area,
+        "title": f"Merged Parcel #{p1['parcel_id']}+{p2['parcel_id']}",
+        "status": "Verified"
+    })
+    DatabaseService.delete_parcel(p2["id"])
+    add_audit_log(
+        "Surveyor R. Ramanathan",
+        "Merged Parcels",
+        p1["parcel_id"],
+        f"Parcels {p1['parcel_id']}, {p2['parcel_id']}",
+        "Merged",
+        f"Merged parcels {p1['parcel_id']} and {p2['parcel_id']} into single polygon ({merged_area} m²)."
+    )
+    return DatabaseService.get_parcel_by_id(p1["id"])
+
+@router.post("/parcels/split")
+def split_parcel(payload: Dict[str, Any]):
+    parcel_id = payload.get("parcel_id")
+    cut_line = payload.get("cut_line")
+    if not parcel_id or not cut_line:
+        raise HTTPException(status_code=400, detail="parcel_id and cut_line required for split.")
+    p = DatabaseService.get_parcel_by_id(parcel_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Parcel not found for splitting.")
+    
+    parts = TopologyValidationService.split_parcel(p["geometry"], cut_line)
+    if len(parts) < 2:
+        raise HTTPException(status_code=400, detail="Split line does not bisect the parcel polygon into 2 or more pieces.")
+    
+    # Update first parcel with part[0]
+    area_0 = TopologyValidationService.calculate_polygon_area_sqm(parts[0])
+    DatabaseService.update_parcel(p["id"], {
+        "geometry": parts[0],
+        "ai_area_sqm": area_0,
+        "status": "Verified"
+    })
+
+    # Create new parcel with part[1]
+    new_pid = f"{p['parcel_id']}-B"
+    area_1 = TopologyValidationService.calculate_polygon_area_sqm(parts[1])
+    new_parcel = DatabaseService.create_parcel({
+        "parcel_id": new_pid,
+        "title": f"Parcel #{new_pid} (Subdivision)",
+        "address": p.get("address", "Subdivided Parcel"),
+        "zone": p.get("zone", "M-2"),
+        "status": "Verified",
+        "geometry": parts[1],
+        "ai_area_sqm": area_1,
+        "existing_area_sqm": area_1
+    })
+
+    add_audit_log(
+        "Surveyor R. Ramanathan",
+        "Split Parcel Polygon",
+        p["parcel_id"],
+        p["parcel_id"],
+        f"Split into {p['parcel_id']} and {new_pid}",
+        f"Subdivided parcel {p['parcel_id']} along cutter line."
+    )
+    p_a = DatabaseService.get_parcel_by_id(p["id"])
+    return {
+        "parcel_a": p_a,
+        "parcel_b": new_parcel,
+        "updated_parcel": p_a,
+        "new_parcel": new_parcel
+    }
+
 # GIS LAYERS
 @router.get("/gis/geojson")
-def get_complete_cadastral_geojson():
-    """Combined FeatureCollection for map layers."""
+def get_complete_cadastral_geojson(mode: str = Query("real", enum=["real", "demo", "all"])):
+    """Combined FeatureCollection for map layers with source attribution."""
     features = []
-    parcels = DatabaseService.get_parcels() or parcels_db
-    buildings = DatabaseService.get_buildings() or buildings_db
-    roads = DatabaseService.get_roads() or roads_db
-    conflicts = DatabaseService.get_conflicts() or conflicts_db
+    parcels = DatabaseService.get_parcels(mode=mode) or []
+    buildings = DatabaseService.get_buildings(mode=mode) or []
+    roads = DatabaseService.get_roads(mode=mode) or []
+    conflicts = DatabaseService.get_conflicts(mode=mode) or []
+    land_uses = DatabaseService.get_land_use(mode=mode) or []
 
     # Parcels
     for p in parcels:
+        source_label = "Drone AI Segmentation" if p.get("dataset_id") else "Demo Cadastral Reference"
         features.append({
             "type": "Feature",
             "id": p["id"],
@@ -252,11 +455,13 @@ def get_complete_cadastral_geojson():
                 "zone": p["zone"],
                 "status": p["status"],
                 "confidence_score": p["confidence_score"],
-                "existing_area_sqm": p["existing_area_sqm"],
-                "ai_area_sqm": p["ai_area_sqm"],
-                "difference_sqm": p["difference_sqm"],
-                "suitability_score": p["suitability_score"],
-                "valuation_usd": p["valuation_usd"]
+                "existing_area_sqm": p.get("existing_area_sqm"),
+                "ai_area_sqm": p.get("ai_area_sqm"),
+                "difference_sqm": p.get("difference_sqm"),
+                "suitability_score": p.get("suitability_score"),
+                "valuation_usd": p.get("valuation_usd"),
+                "source": source_label,
+                "dataset_id": p.get("dataset_id")
             },
             "geometry": p["geometry"]
         })
@@ -267,7 +472,8 @@ def get_complete_cadastral_geojson():
                 "properties": {
                     "layer_type": "existing_parcel_boundary",
                     "parcel_id": p["parcel_id"],
-                    "status": "Official Registry Record"
+                    "status": "Official Registry Record",
+                    "source": "Sub-Registrar Revenue Registry"
                 },
                 "geometry": p["existing_geometry"]
             })
@@ -279,8 +485,11 @@ def get_complete_cadastral_geojson():
             "properties": {
                 "layer_type": "building",
                 "parcel_id": b.get("parcel_id"),
-                "footprint_area_sqm": b.get("footprint_area_sqm", 250),
-                "height_meters": b.get("height_meters", 12.5)
+                "footprint_area_sqm": b.get("footprint_area_sqm"),
+                "height_meters": b.get("height_meters"),
+                "relationship": b.get("relationship", "none"),
+                "intersection_area_sqm": b.get("intersection_area_sqm", 0.0),
+                "source": "Drone Photogrammetry Extraction" if b.get("dataset_id") else "Demo Building Reference"
             },
             "geometry": b["geometry"]
         })
@@ -293,7 +502,8 @@ def get_complete_cadastral_geojson():
                 "layer_type": "road",
                 "name": r.get("name", "Access Corridor"),
                 "road_type": r.get("road_type", "Primary Road"),
-                "width_meters": r.get("width_meters", 15.0)
+                "width_meters": r.get("width_meters"),
+                "source": "Drone Road Corridor Analysis" if r.get("dataset_id") else "Demo Road Network"
             },
             "geometry": r["geometry"]
         })
@@ -307,45 +517,328 @@ def get_complete_cadastral_geojson():
                 "parcel_id": c["parcel_id"],
                 "conflict_type": c["conflict_type"],
                 "difference_sqm": c["difference_sqm"],
-                "severity": c["severity"]
+                "severity": c["severity"],
+                "source": "Topology Engine Spatial Discrepancy"
             },
             "geometry": c["geometry"]
         })
+    # Land Use
+    for lu in land_uses:
+        features.append({
+            "type": "Feature",
+            "id": lu["id"],
+            "properties": {
+                "layer_type": "land_use",
+                "category": lu.get("category", "Vegetation"),
+                "area_sqm": lu.get("area_sqm", 0.0),
+                "source": "Multispectral Drone Classification"
+            },
+            "geometry": lu["geometry"]
+        })
     return {
         "type": "FeatureCollection",
+        "mode": mode,
         "features": features
     }
 
 @router.get("/buildings")
-def get_buildings():
-    return DatabaseService.get_buildings()
+def get_buildings(dataset_id: Optional[str] = None, mode: str = Query("real", enum=["real", "demo", "all"])):
+    return DatabaseService.get_buildings(dataset_id=dataset_id, mode=mode)
 
 @router.get("/roads")
-def get_roads():
-    return DatabaseService.get_roads()
+def get_roads(dataset_id: Optional[str] = None, mode: str = Query("real", enum=["real", "demo", "all"])):
+    return DatabaseService.get_roads(dataset_id=dataset_id, mode=mode)
+
+@router.get("/land-use")
+def get_land_use(dataset_id: Optional[str] = None, mode: str = Query("real", enum=["real", "demo", "all"])):
+    return DatabaseService.get_land_use(dataset_id=dataset_id, mode=mode)
+
+def calculate_polygon_perimeter_m(geom: Optional[Dict[str, Any]]) -> float:
+    if not geom or not isinstance(geom, dict):
+        return 0.0
+    coords = geom.get("coordinates")
+    if not coords or not isinstance(coords, list):
+        return 0.0
+    ring = coords[0] if isinstance(coords[0], list) and isinstance(coords[0][0], (list, tuple)) else coords
+    if len(ring) < 2:
+        return 0.0
+    total_dist = 0.0
+    for i in range(len(ring) - 1):
+        p1 = ring[i]
+        p2 = ring[i + 1]
+        try:
+            lon1, lat1 = float(p1[0]), float(p1[1])
+            lon2, lat2 = float(p2[0]), float(p2[1])
+            if abs(lat1) > 90 or abs(lon1) > 180 or abs(lat2) > 90 or abs(lon2) > 180:
+                dx = lon2 - lon1
+                dy = lat2 - lat1
+                total_dist += math.hypot(dx, dy)
+            else:
+                dlat = math.radians(lat2 - lat1)
+                dlon = math.radians(lon2 - lon1)
+                a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+                c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                total_dist += 6371000.0 * c
+        except Exception:
+            continue
+    return round(total_dist, 2)
+
+# ==============================================================================
+# REAL GIS MAP & FEATURE APIs: /api/gis/*
+# ==============================================================================
+@router.get("/gis/datasets")
+def get_gis_datasets(source_type: Optional[str] = None):
+    return DatabaseService.get_datasets(source_type=source_type)
+
+@router.get("/gis/datasets/{dataset_id}")
+def get_gis_dataset(dataset_id: str):
+    ds = DatabaseService.get_dataset(dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="GIS dataset not found")
+    return ds
+
+@router.get("/gis/layers")
+def get_gis_layers(dataset_id: Optional[str] = None):
+    ds = DatabaseService.get_dataset(dataset_id) if dataset_id else None
+    if not ds:
+        datasets = DatabaseService.get_datasets()
+        ds = datasets[0] if datasets else None
+
+    target_ds_id = ds["id"] if ds else None
+    parcels = DatabaseService.get_parcels(dataset_id=target_ds_id, mode="real") or []
+    buildings = DatabaseService.get_buildings(dataset_id=target_ds_id, mode="real") or []
+    roads = DatabaseService.get_roads(dataset_id=target_ds_id, mode="real") or []
+    land_use = DatabaseService.get_land_use(dataset_id=target_ds_id, mode="real") or []
+    conflicts = DatabaseService.get_conflicts(dataset_id=target_ds_id, mode="real") or []
+
+    veg_features = [l for l in land_use if "veg" in l.get("category", "").lower() or "tree" in l.get("category", "").lower()]
+    water_features = [l for l in land_use if "water" in l.get("category", "").lower()]
+    open_land_features = [l for l in land_use if "open" in l.get("category", "").lower() or "barren" in l.get("category", "").lower()]
+
+    ai_model = SegmentationModel.get_instance()
+    has_weights = ai_model.has_weights()
+    has_ortho = bool(ds and ds.get("file_path") and os.path.exists(ds.get("file_path")))
+
+    return {
+        "dataset_id": target_ds_id,
+        "dataset_name": ds.get("name") if ds else "No GIS dataset loaded",
+        "crs": ds.get("crs") if ds and ds.get("crs") else "Not Available",
+        "layers": [
+            {
+                "id": "base_map",
+                "label": "Base Map (Reference Only)",
+                "category": "reference",
+                "enabled": False,
+                "has_data": True,
+                "description": "External reference tiles; not legal cadastral data"
+            },
+            {
+                "id": "orthomosaic",
+                "label": "Uploaded Orthomosaic / GeoTIFF",
+                "category": "raster",
+                "enabled": has_ortho,
+                "has_data": has_ortho,
+                "empty_reason": None if has_ortho else "No data available."
+            },
+            {
+                "id": "parcels",
+                "label": "Parcel Boundaries",
+                "category": "vector",
+                "enabled": len(parcels) > 0,
+                "has_data": len(parcels) > 0,
+                "count": len(parcels),
+                "empty_reason": None if len(parcels) > 0 else "No data available."
+            },
+            {
+                "id": "buildings",
+                "label": "Building Footprints",
+                "category": "vector",
+                "enabled": len(buildings) > 0,
+                "has_data": len(buildings) > 0,
+                "count": len(buildings),
+                "empty_reason": None if len(buildings) > 0 else "No data available."
+            },
+            {
+                "id": "roads",
+                "label": "Road Network",
+                "category": "vector",
+                "enabled": len(roads) > 0,
+                "has_data": len(roads) > 0,
+                "count": len(roads),
+                "empty_reason": None if len(roads) > 0 else "No data available."
+            },
+            {
+                "id": "vegetation",
+                "label": "Vegetation",
+                "category": "vector",
+                "enabled": len(veg_features) > 0,
+                "has_data": len(veg_features) > 0,
+                "count": len(veg_features),
+                "empty_reason": None if len(veg_features) > 0 else "No data available."
+            },
+            {
+                "id": "water",
+                "label": "Water",
+                "category": "vector",
+                "enabled": len(water_features) > 0,
+                "has_data": len(water_features) > 0,
+                "count": len(water_features),
+                "empty_reason": None if len(water_features) > 0 else "No data available."
+            },
+            {
+                "id": "open_land",
+                "label": "Open Land",
+                "category": "vector",
+                "enabled": len(open_land_features) > 0,
+                "has_data": len(open_land_features) > 0,
+                "count": len(open_land_features),
+                "empty_reason": None if len(open_land_features) > 0 else "No data available."
+            },
+            {
+                "id": "ai_detection",
+                "label": "AI Detection/Segmentation Results",
+                "category": "ai",
+                "enabled": has_weights,
+                "has_data": has_weights,
+                "ai_status": "Ready" if has_weights else "AI MODEL NOT AVAILABLE",
+                "empty_reason": None if has_weights else "AI MODEL NOT AVAILABLE"
+            },
+            {
+                "id": "change_detection",
+                "label": "Change Detection",
+                "category": "temporal",
+                "enabled": len(conflicts) > 0,
+                "has_data": len(conflicts) > 0,
+                "count": len(conflicts),
+                "empty_reason": None if len(conflicts) > 0 else "No data available."
+            }
+        ]
+    }
+
+@router.get("/gis/parcels")
+def get_gis_parcels(
+    search: Optional[str] = None,
+    zone: Optional[str] = None,
+    status: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    mode: str = "real"
+):
+    parcels = DatabaseService.get_parcels(search=search, zone=zone, status=status, dataset_id=dataset_id, mode=mode) or []
+    for p in parcels:
+        if "perimeter_m" not in p or not p["perimeter_m"]:
+            p["perimeter_m"] = calculate_polygon_perimeter_m(p.get("geometry", {}))
+        if "area_sqm" not in p or not p["area_sqm"]:
+            p["area_sqm"] = p.get("ai_area_sqm") or p.get("existing_area_sqm") or 0.0
+        p["source"] = p.get("source") or ("Drone AI Extraction" if p.get("dataset_id") else "User Digitized / GIS Reference")
+        p["verification_status"] = p.get("status") or "Requires Verification"
+    return parcels
+
+@router.get("/gis/buildings")
+def get_gis_buildings(dataset_id: Optional[str] = None, mode: str = "real"):
+    buildings = DatabaseService.get_buildings(dataset_id=dataset_id, mode=mode) or []
+    for b in buildings:
+        b["source"] = b.get("source") or "Drone AI Segmentation"
+        b["verification_status"] = b.get("status") or "Unverified AI Footprint"
+        b["area"] = b.get("footprint_area_sqm") or 0.0
+    return buildings
+
+@router.get("/gis/roads")
+def get_gis_roads(dataset_id: Optional[str] = None, mode: str = "real"):
+    roads = DatabaseService.get_roads(dataset_id=dataset_id, mode=mode) or []
+    for r in roads:
+        r["source"] = r.get("source") or "Drone AI Vector Extraction"
+        r["verification_status"] = r.get("status") or "Unverified Network"
+    return roads
+
+@router.post("/gis/parcels")
+def create_gis_parcel(payload: Dict[str, Any]):
+    new_p = DatabaseService.create_parcel(payload)
+    if not new_p:
+        raise HTTPException(status_code=400, detail="Failed to create parcel polygon.")
+    new_p["perimeter_m"] = calculate_polygon_perimeter_m(new_p.get("geometry", {}))
+    new_p["area_sqm"] = new_p.get("ai_area_sqm") or new_p.get("existing_area_sqm") or 0.0
+    new_p["source"] = "User Digitized GIS Feature"
+    new_p["verification_status"] = new_p.get("status") or "Surveyor Verified"
+    return new_p
+
+@router.put("/gis/parcels/{parcel_id}")
+def update_gis_parcel(parcel_id: str, update_data: Dict[str, Any]):
+    updated = DatabaseService.update_parcel(parcel_id, update_data)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Parcel not found")
+    updated["perimeter_m"] = calculate_polygon_perimeter_m(updated.get("geometry", {}))
+    updated["area_sqm"] = updated.get("ai_area_sqm") or updated.get("existing_area_sqm") or 0.0
+    return updated
+
+@router.delete("/gis/parcels/{parcel_id}")
+def delete_gis_parcel(parcel_id: str):
+    p = DatabaseService.get_parcel_by_id(parcel_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Parcel not found")
+    DatabaseService.delete_parcel(parcel_id)
+    return {"success": True, "deleted_id": parcel_id}
 
 @router.get("/pathways")
 def get_pathways():
-    return pathways_db
+    return []
+
+@router.get("/ai/model-status")
+def get_ai_model_status():
+    ai_model = SegmentationModel.get_instance()
+    return ai_model.get_info()
+
+@router.get("/changes")
+def get_temporal_changes():
+    datasets = DatabaseService.get_datasets()
+    if len(datasets) < 2:
+        return {
+            "status": "Not Available — Second temporal dataset required",
+            "message": "Temporal change detection requires two georeferenced raster datasets captured at different epochs (Date A and Date B).",
+            "total_changes": 0,
+            "changes": []
+        }
+    return DatabaseService.get_changes()
 
 # AI EXTRACTION
 @router.post("/ai/extract")
 def trigger_extraction(payload: Dict[str, Any]):
     job_id = f"JOB-AI-{uuid.uuid4().hex[:6].upper()}"
-    dataset_id = payload.get("dataset_id", "ds-tech-district")
-    dataset = DatabaseService.get_dataset(dataset_id)
-    bounds = dataset.get("bounds") if dataset else [[12.9740, 77.6340], [12.9840, 77.6460]]
+    dataset_id = payload.get("dataset_id")
+    dataset = DatabaseService.get_dataset(dataset_id) if dataset_id else None
+    bounds = dataset.get("bounds") if dataset else None
     options = payload.get("options", {})
 
     extraction_res = AIExtractionService.extract_cadastral_features(dataset_id, bounds, options)
-    parcels = extraction_res["parcels"]
-    buildings = extraction_res["buildings"]
-    roads = extraction_res["roads"]
-    conflicts = extraction_res["conflicts"]
-    stats = extraction_res["stats"]
+    if extraction_res.get("status") == "AI MODEL NOT AVAILABLE":
+        return {
+            "status": "AI MODEL NOT AVAILABLE",
+            "message": extraction_res.get("message", "Trained segmentation model weights are required for real AI extraction."),
+            "model_status": "AI MODEL NOT INSTALLED",
+            "job_id": job_id,
+            "dataset_id": dataset_id,
+            "progress_pct": 0,
+            "extracted_parcels": 0,
+            "extracted_buildings": 0,
+            "extracted_roads": 0,
+            "boundary_conflicts": 0,
+            "is_development_mode": True
+        }
+
+    parcels = extraction_res.get("parcels", [])
+    buildings = extraction_res.get("buildings", [])
+    roads = extraction_res.get("roads", [])
+    conflicts = extraction_res.get("conflicts", [])
+    stats = extraction_res.get("stats", {})
 
     # Persist extracted features to SQLite database
-    DatabaseService.add_extracted_features(dataset_id, parcels, buildings, roads, conflicts)
+    DatabaseService.add_extracted_features(
+        dataset_id,
+        parcels,
+        buildings,
+        roads,
+        conflicts,
+        land_use=extraction_res.get("land_use", [])
+    )
 
     job_info = {
         "job_id": job_id,
@@ -353,14 +846,17 @@ def trigger_extraction(payload: Dict[str, Any]):
         "status": "Completed",
         "progress_pct": 100,
         "created_at": datetime.now().isoformat(),
-        "extracted_parcels": stats["parcels_detected"],
-        "extracted_buildings": stats["buildings_extracted"],
-        "extracted_roads": stats["road_segments"],
+        "extracted_parcels": stats.get("parcels_detected", 0),
+        "extracted_buildings": stats.get("buildings_extracted", 0),
+        "extracted_roads": stats.get("road_segments", 0),
+        "extracted_land_use": stats.get("land_use_polygons", 0),
+        "linked_buildings": stats.get("linked_buildings", 0),
         "extracted_pathways": 0,
-        "boundary_conflicts": stats["boundary_conflicts"],
-        "is_development_mode": extraction_res["is_development_mode"],
-        "model_name": extraction_res["model_name"],
-        "notice": "Development Pipeline Interface: Running on CPU geometric extraction engine. Connect model weights (YOLO/SAM) in backend/models/weights/ for production GPU inference." if extraction_res["is_development_mode"] else "Running production inference."
+        "boundary_conflicts": stats.get("boundary_conflicts", 0),
+        "is_development_mode": extraction_res.get("is_development_mode", False),
+        "model_status": stats.get("model_status", "REAL AI PROCESSING"),
+        "model_name": extraction_res.get("model_name", "AI Segmentation Model"),
+        "notice": "Trained model inference completed."
     }
     jobs_db[job_id] = job_info
     add_audit_log(
@@ -391,8 +887,8 @@ def get_job_status(job_id: str):
 
 # CONFLICTS
 @router.get("/conflicts")
-def get_conflicts():
-    return DatabaseService.get_conflicts()
+def get_conflicts(mode: str = Query("real", enum=["real", "demo", "all"])):
+    return DatabaseService.get_conflicts(mode=mode)
 
 @router.get("/conflicts/{conflict_id}")
 def get_conflict(conflict_id: str):
@@ -422,6 +918,40 @@ def resolve_conflict(conflict_id: str, payload: Dict[str, Any]):
 def get_verification_tasks():
     return DatabaseService.get_verification_tasks()
 
+@router.post("/verification/{parcel_id}/accept")
+def accept_parcel_verification(parcel_id: str, payload: Optional[Dict[str, Any]] = None):
+    p = DatabaseService.get_parcel_by_id(parcel_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Parcel not found")
+    updated = DatabaseService.update_parcel(parcel_id, {"status": "Human Verified"})
+    notes = (payload or {}).get("notes", "Parcel boundary verified and accepted by cadastral surveyor.")
+    add_audit_log(
+        "Surveyor R. Ramanathan",
+        "Parcel Accepted",
+        p["parcel_id"],
+        p["status"],
+        "Human Verified",
+        notes
+    )
+    return updated or p
+
+@router.post("/verification/{parcel_id}/reject")
+def reject_parcel_verification(parcel_id: str, payload: Optional[Dict[str, Any]] = None):
+    p = DatabaseService.get_parcel_by_id(parcel_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Parcel not found")
+    updated = DatabaseService.update_parcel(parcel_id, {"status": "Rejected"})
+    notes = (payload or {}).get("notes", "Parcel boundary rejected by cadastral surveyor.")
+    add_audit_log(
+        "Surveyor R. Ramanathan",
+        "Parcel Rejected",
+        p["parcel_id"],
+        p["status"],
+        "Rejected",
+        notes
+    )
+    return updated or p
+
 @router.put("/verification/tasks/{parcel_id}")
 def submit_verification(parcel_id: str, payload: Dict[str, Any]):
     p = DatabaseService.get_parcel_by_id(parcel_id)
@@ -430,16 +960,30 @@ def submit_verification(parcel_id: str, payload: Dict[str, Any]):
     action = payload.get("action", "Accept AI")
     updates = {}
     if action == "Accept AI":
-        updates["status"] = "Verified"
-        updates["confidence_score"] = 0.99
+        updates["status"] = "Human Verified"
     elif action == "Correct Boundary":
-        updates["status"] = "Verified"
+        updates["status"] = "Human Verified"
         if "coordinates" in payload:
             updates["geometry"] = {"type": "Polygon", "coordinates": payload["coordinates"]}
+        if "ai_area_sqm" in payload:
+            updates["ai_area_sqm"] = float(payload["ai_area_sqm"])
+            updates["difference_sqm"] = round(float(payload["ai_area_sqm"]) - float(p.get("existing_area_sqm", 0)), 2)
+    elif action in ("Finalize", "Sign-off"):
+        updates["status"] = "Final"
     elif action == "Reject":
         updates["status"] = "Rejected"
     elif action == "Send to Ground Truth":
         updates["status"] = "Requires Verification"
+        geom = p.get("geometry")
+        poly_coords = None
+        if isinstance(geom, dict) and geom.get("coordinates"):
+            try:
+                from shapely.geometry import shape
+                s = shape(geom)
+                if not s.is_empty:
+                    poly_coords = [round(s.centroid.y, 6), round(s.centroid.x, 6)]
+            except Exception:
+                poly_coords = None
         gt_task = {
             "id": f"gt-{uuid.uuid4().hex[:4]}",
             "parcel_id": p["parcel_id"],
@@ -449,7 +993,7 @@ def submit_verification(parcel_id: str, payload: Dict[str, Any]):
             "status": "Assigned",
             "gnss_accuracy_cm": 2.0,
             "cors_reference": "TN-CORS-KA-04",
-            "coordinates": [12.9785, 77.6405],
+            "coordinates": poly_coords,
             "evidence_notes": payload.get("notes", "Survey task assigned via Verification portal"),
             "evidence_files": []
         }
@@ -469,8 +1013,8 @@ def submit_verification(parcel_id: str, payload: Dict[str, Any]):
 # GROUND TRUTH
 @router.get("/ground-truth")
 @router.get("/ground-truth/tasks")
-def get_ground_truth_tasks():
-    return DatabaseService.get_ground_truth_tasks()
+def get_ground_truth_tasks(mode: str = Query("real", enum=["real", "demo", "all"])):
+    return DatabaseService.get_ground_truth_tasks(mode=mode)
 
 @router.post("/ground-truth")
 def create_ground_truth_task(task: Dict[str, Any]):
@@ -656,16 +1200,72 @@ def delete_task_evidence(task_id: str, evidence_id: str):
 def get_changes():
     return DatabaseService.get_changes()
 
-# TOPOLOGY
+# TOPOLOGY & POLYGON CREATION
 @router.get("/topology/issues")
 def get_topology_issues():
-    return topology_db
+    result = TopologyValidationService.run_validation()
+    return result.get("inconsistencies", [])
 
 @router.post("/topology/validate")
 def run_topology_validation():
     result = TopologyValidationService.run_validation()
-    add_audit_log("System Engine", "Topology Validation", "SYSTEM", "Unchecked", "Validated", f"Pass rate {result['pass_rate_pct']}% with {result['summary']['errors_count']} errors.")
+    add_audit_log(
+        "System Engine",
+        "Topology Validation",
+        "SYSTEM",
+        "Unchecked",
+        "Validated",
+        f"Pass rate {result['pass_rate_pct']}% with {result['summary']['errors_count']} errors and {len(result.get('overlaps', []))} boundary overlaps."
+    )
     return result
+
+@router.post("/topology/generate")
+def generate_topology_and_polygons(payload: Dict[str, Any]):
+    """
+    Automated topology generation & parcel polygon creation:
+    Converts linework/vectors or survey extent into clean planar polygon topology.
+    """
+    lines = payload.get("lines")
+    bounds = payload.get("bounds")
+    save_to_db = payload.get("save_to_db", False)
+
+    if lines:
+        res = TopologyValidationService.generate_topology_from_lines(lines)
+        if save_to_db and res.get("success"):
+            for p in res.get("parcels", []):
+                DatabaseService.create_parcel(p)
+        return res
+    else:
+        active_datasets = DatabaseService.get_datasets()
+        extent_bounds = bounds or (active_datasets[0].get("bounds") if active_datasets and active_datasets[0].get("bounds") else None)
+        if not extent_bounds:
+            raise HTTPException(
+                status_code=400,
+                detail="Valid georeferenced spatial extent bounds required. Please upload or specify a georeferenced raster extent."
+            )
+        rows = int(payload.get("rows", 3))
+        cols = int(payload.get("cols", 3))
+        parcels = TopologyValidationService.generate_parcels_from_extent(extent_bounds, rows, cols)
+        if save_to_db:
+            for p in parcels:
+                DatabaseService.create_parcel(p)
+        return {
+            "success": True,
+            "total_polygons_generated": len(parcels),
+            "parcels": parcels
+        }
+
+@router.post("/conflicts/detect")
+def detect_conflicts():
+    result = TopologyValidationService.run_validation()
+    conflicts = DatabaseService.get_conflicts()
+    return {
+        "status": "Completed",
+        "total_conflicts": len(conflicts),
+        "overlaps_detected": len(result.get("overlaps", [])),
+        "conflicts": conflicts
+    }
+
 
 # REPORTS
 @router.post("/reports")
@@ -712,70 +1312,11 @@ def get_audit_trail():
     return DatabaseService.get_audit_logs()
 
 # DRONE INGESTION PIPELINE (Upload -> Validate -> Preview -> Process -> AI Extraction)
-drone_missions_db = [
-    {
-        "id": "mission-01",
-        "name": "Tech District Phase II Drone Orthomosaic",
-        "flight_date": "2026-08-15",
-        "ori_filename": "ORI_TechDistrict_2026.tif",
-        "dsm_filename": "DSM_TechDistrict_5cm.tif",
-        "dtm_filename": "DTM_BareEarth.tif",
-        "camera": "DJI Zenmuse P1 (45 MP Full-Frame)",
-        "sensor_size_mm": "35.9 x 24.0",
-        "lens_focal_length_mm": 35.0,
-        "flight_altitude_m": 120.0,
-        "forward_overlap_pct": 82.0,
-        "side_overlap_pct": 75.0,
-        "gsd_cm_per_px": 5.0,
-        "raster_width_px": 8420,
-        "raster_height_px": 6180,
-        "crs": "EPSG:4326 / WGS 84 (UTM Zone 43N)",
-        "bands_count": 4,
-        "bands_description": "R, G, B, NIR (Near-Infrared)",
-        "bit_depth": "16-bit Float",
-        "bounds": {
-            "min_lat": 12.9750,
-            "max_lat": 12.9830,
-            "min_lng": 77.6350,
-            "max_lng": 77.6460
-        },
-        "coverage_sq_km": 14.2,
-        "status": "Ready for Extraction"
-    },
-    {
-        "id": "mission-02",
-        "name": "Metropolitan Outer Ring Resurvey",
-        "flight_date": "2026-07-22",
-        "ori_filename": "ORI_MetroOuterRing_4.5cm.tif",
-        "dsm_filename": "DSM_MetroOuterRing.tif",
-        "dtm_filename": "DTM_MetroOuterRing.tif",
-        "camera": "Phase One iXM-100 (100 MP)",
-        "sensor_size_mm": "53.4 x 40.0",
-        "lens_focal_length_mm": 50.0,
-        "flight_altitude_m": 150.0,
-        "forward_overlap_pct": 85.0,
-        "side_overlap_pct": 78.0,
-        "gsd_cm_per_px": 4.5,
-        "raster_width_px": 11600,
-        "raster_height_px": 8700,
-        "crs": "EPSG:4326 / WGS 84 (UTM Zone 44N)",
-        "bands_count": 3,
-        "bands_description": "RGB True Color",
-        "bit_depth": "8-bit Unsigned Integer",
-        "bounds": {
-            "min_lat": 13.0800,
-            "max_lat": 13.0900,
-            "min_lng": 80.2650,
-            "max_lng": 80.2780
-        },
-        "coverage_sq_km": 18.6,
-        "status": "Ready for Extraction"
-    }
-]
+drone_missions_db: List[Dict[str, Any]] = []
 
 @router.get("/drone/missions")
 def get_drone_missions():
-    return drone_missions_db
+    return DatabaseService.get_datasets()
 
 @router.post("/drone/upload")
 def upload_drone_data(payload: Dict[str, Any]):
@@ -872,13 +1413,345 @@ def process_drone_data(payload: Dict[str, Any]):
     add_audit_log("System Engine", "Processed Drone Data", ori_file, "Raw GeoTIFF", "Tiled & Radiometrically Calibrated", f"Preprocessing job {job_id} finished in 4.12s.")
     return processing_result
 
+# ==============================================================================
+# REAL DATASET INGESTION API: /api/datasets/*
+# Supports:
+# 1. Government / Open GIS (GeoJSON, Shapefile .zip, GeoPackage, WMS/WFS)
+# 2. Existing GeoTIFF (real raster metadata, CRS, affine, resolution, bounds)
+# 3. Drone Image Upload (JPG, PNG, unreferenced or referenced)
+# ==============================================================================
+
+@router.get("/datasets")
+def get_all_datasets(source_type: Optional[str] = None):
+    return DatabaseService.get_datasets(source_type)
+
+@router.post("/datasets/upload")
+async def upload_dataset(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    data_type: str = Form("Drone Orthomosaic"),
+    name: Optional[str] = Form(None),
+    source_type: Optional[str] = Form(None)
+):
+    dataset_id = f"ds-{uuid.uuid4().hex[:8]}"
+    content_type = request.headers.get("content-type", "")
+    if not file or "multipart/form-data" not in content_type:
+        raise HTTPException(
+            status_code=400,
+            detail="Multipart file upload required. Please upload a real GeoTIFF or drone raster."
+        )
+
+    saved_meta = await DroneUploadService.save_uploaded_file(file, dataset_id)
+    inspection = GeospatialService.inspect_and_validate(
+        saved_meta["storage_path"],
+        saved_meta["original_filename"]
+    )
+    
+    ext = os.path.splitext(saved_meta["original_filename"])[1].lower()
+    inferred_source = source_type
+    if not inferred_source:
+        if ext in (".tif", ".tiff") or "geotiff" in inspection.get("type", "").lower():
+            inferred_source = "existing_geotiff"
+        else:
+            inferred_source = "drone_upload"
+
+    preview_path = PreprocessingService.generate_preview(
+        saved_meta["storage_path"],
+        saved_meta["dataset_dir"]
+    )
+    
+    dataset_name = name or saved_meta["original_filename"].replace(".tif", "").replace("_", " ").title()
+    crs_val = inspection.get("crs") if inspection.get("is_georeferenced") else "Unreferenced Image"
+    
+    dataset_record = DatabaseService.create_dataset({
+        "id": dataset_id,
+        "name": dataset_name,
+        "original_filename": saved_meta["original_filename"],
+        "storage_filename": saved_meta["storage_filename"],
+        "storage_path": saved_meta["storage_path"],
+        "file_size_bytes": saved_meta["file_size_bytes"],
+        "file_size_str": saved_meta["file_size_str"],
+        "file_format": inspection.get("type", "Image"),
+        "data_type": data_type,
+        "crs": crs_val,
+        "resolution": inspection.get("resolution") or "Not Available",
+        "gsd_cm": inspection.get("gsd_cm"),
+        "coverage_sqkm": inspection.get("coverage_sqkm"),
+        "coverage_str": inspection.get("coverage_str") or "Not Available",
+        "width_px": inspection.get("width", 0),
+        "height_px": inspection.get("height", 0),
+        "bands": inspection.get("bands", 3),
+        "bounds": inspection.get("bounds"),
+        "metadata": {
+            "checklist": inspection.get("checklist", []),
+            "dimensions": inspection.get("dimensions", "0 × 0 px"),
+            "nodata": inspection.get("nodata"),
+            "dtype": inspection.get("dtype")
+        },
+        "preview_path": preview_path,
+        "upload_status": "uploaded",
+        "source_type": inferred_source,
+        "layer_type": "raster",
+        "affine_transform": inspection.get("transform")
+    })
+    
+    add_audit_log(
+        "Surveyor R. Ramanathan",
+        "Uploaded Dataset",
+        dataset_id,
+        "None",
+        "Uploaded & Inspected",
+        f"Uploaded {saved_meta['original_filename']} ({saved_meta['file_size_str']}) as {inferred_source}. CRS: {crs_val}"
+    )
+    return dataset_record
+
+@router.post("/datasets/import")
+async def import_government_dataset(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    name: Optional[str] = Form(None),
+    source_organization: str = Form("Government / Open GIS"),
+    source_url: Optional[str] = Form(None),
+    acquisition_date: Optional[str] = Form(None),
+    date_accessed: Optional[str] = Form(None),
+    file_format: Optional[str] = Form(None),
+    service_url: Optional[str] = Form(None),
+    crs: Optional[str] = Form(None)
+):
+    dataset_id = f"ds-{uuid.uuid4().hex[:8]}"
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    acq_date = acquisition_date or today_str
+    access_date = date_accessed or today_str
+    
+    # Mode A: Service URL provided (WMS / WMTS / WFS / OGC API)
+    if service_url and not file:
+        srv_name = name or f"OGC Service - {source_organization}"
+        fmt = file_format or "WMS/WFS Service"
+        record = DatabaseService.create_dataset({
+            "id": dataset_id,
+            "name": srv_name,
+            "original_filename": srv_name,
+            "storage_filename": "",
+            "storage_path": "",
+            "file_size_bytes": 0,
+            "file_size_str": "Remote Service",
+            "file_format": fmt,
+            "data_type": "Government GIS Service",
+            "crs": crs or "EPSG:4326",
+            "source_type": "government_open_gis",
+            "source_organization": source_organization,
+            "source_url": source_url or service_url,
+            "service_url": service_url,
+            "acquisition_date": acq_date,
+            "date_accessed": access_date,
+            "layer_type": "service",
+            "upload_status": "connected"
+        })
+        return record
+
+    # Mode B: File upload provided (GeoJSON, Shapefile zip, GPKG, GeoTIFF)
+    if file:
+        saved_meta = await DroneUploadService.save_uploaded_file(file, dataset_id)
+        inspection = GeospatialService.inspect_and_validate(
+            saved_meta["storage_path"],
+            saved_meta["original_filename"]
+        )
+        
+        detected_format = inspection.get("type", file_format or "GIS Data")
+        is_vector = "vector" in detected_format.lower() or "geojson" in detected_format.lower() or "shapefile" in detected_format.lower() or "geopackage" in detected_format.lower()
+        
+        preview_path = None
+        if not is_vector and inspection.get("is_georeferenced"):
+            preview_path = PreprocessingService.generate_preview(
+                saved_meta["storage_path"],
+                saved_meta["dataset_dir"]
+            )
+            
+        ds_name = name or saved_meta["original_filename"].replace("_", " ").title()
+        vector_geojson_str = json.dumps(inspection["geojson"]) if inspection.get("geojson") else None
+        
+        record = DatabaseService.create_dataset({
+            "id": dataset_id,
+            "name": ds_name,
+            "original_filename": saved_meta["original_filename"],
+            "storage_filename": saved_meta["storage_filename"],
+            "storage_path": saved_meta["storage_path"],
+            "file_size_bytes": saved_meta["file_size_bytes"],
+            "file_size_str": saved_meta["file_size_str"],
+            "file_format": detected_format,
+            "data_type": "Government Cadastral Dataset",
+            "crs": inspection.get("crs") or crs or "EPSG:4326",
+            "resolution": inspection.get("resolution") or "Not Available",
+            "gsd_cm": inspection.get("gsd_cm"),
+            "coverage_sqkm": inspection.get("coverage_sqkm"),
+            "coverage_str": inspection.get("coverage_str") or "Not Available",
+            "width_px": inspection.get("width", 0),
+            "height_px": inspection.get("height", 0),
+            "bands": inspection.get("bands", 1 if is_vector else 3),
+            "bounds": inspection.get("bounds"),
+            "metadata": {
+                "checklist": inspection.get("checklist", []),
+                "dimensions": inspection.get("dimensions", "Vector Data"),
+                "feature_count": inspection.get("feature_count", 0),
+                "geometry_types": inspection.get("geometry_types", [])
+            },
+            "preview_path": preview_path,
+            "upload_status": "imported",
+            "source_type": "government_open_gis",
+            "source_organization": source_organization,
+            "source_url": source_url,
+            "acquisition_date": acq_date,
+            "date_accessed": access_date,
+            "vector_geojson": vector_geojson_str,
+            "service_url": service_url,
+            "layer_type": "vector" if is_vector else "raster",
+            "affine_transform": inspection.get("transform")
+        })
+        
+        add_audit_log(
+            "Surveyor R. Ramanathan",
+            "Imported Government GIS",
+            dataset_id,
+            "None",
+            "Imported & Indexed",
+            f"Imported {ds_name} from {source_organization} ({record.get('file_size_str')}). Format: {detected_format}"
+        )
+        return record
+
+    raise HTTPException(
+        status_code=400,
+        detail="Please provide either a GIS file (GeoJSON, Shapefile zip, GeoPackage, GeoTIFF) or an OGC Service URL."
+    )
+
+@router.get("/datasets/{id}")
+def get_dataset_by_id(id: str):
+    dataset = DatabaseService.get_dataset(id)
+    if dataset:
+        return dataset
+    raise HTTPException(status_code=404, detail="Dataset not found")
+
+@router.get("/datasets/{id}/metadata")
+def get_dataset_metadata(id: str):
+    dataset = DatabaseService.get_dataset(id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    
+    meta = dataset.get("metadata", {})
+    checklist = meta.get("checklist", []) if isinstance(meta, dict) else []
+    
+    return {
+        "id": dataset["id"],
+        "name": dataset["name"],
+        "original_filename": dataset.get("original_filename"),
+        "source_type": dataset.get("source_type", "drone_upload"),
+        "source_organization": dataset.get("source_organization", "Unknown"),
+        "source_url": dataset.get("source_url"),
+        "crs": dataset.get("crs") or "CRS: Not Available",
+        "bounds": dataset.get("bounds"),
+        "resolution": dataset.get("resolution") or "GSD: Not Available",
+        "gsd_cm": dataset.get("gsd_cm"),
+        "coverage_sqkm": dataset.get("coverage_sqkm"),
+        "coverage_str": dataset.get("coverage_str") or "Not Available",
+        "width_px": dataset.get("width_px"),
+        "height_px": dataset.get("height_px"),
+        "bands": dataset.get("bands"),
+        "file_format": dataset.get("file_format"),
+        "file_size_str": dataset.get("file_size_str"),
+        "affine_transform": dataset.get("affine_transform"),
+        "acquisition_date": dataset.get("acquisition_date") or dataset.get("created_at", "")[:10],
+        "date_accessed": dataset.get("date_accessed") or dataset.get("created_at", "")[:10],
+        "layer_type": dataset.get("layer_type"),
+        "checklist": checklist
+    }
+
+@router.get("/datasets/{id}/layers")
+def get_dataset_layers(id: str):
+    layers = DatabaseService.get_dataset_layers(id)
+    if not layers.get("success"):
+        raise HTTPException(status_code=404, detail=layers.get("error", "Dataset layers not found"))
+    return layers
+
+@router.get("/datasets/{id}/preview")
+def get_dataset_preview(id: str):
+    dataset = DatabaseService.get_dataset(id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if dataset.get("preview_path") and os.path.exists(dataset["preview_path"]):
+        return FileResponse(dataset["preview_path"], media_type="image/png")
+    raise HTTPException(status_code=404, detail="Preview not available for this dataset")
+
+@router.post("/datasets/{id}/process")
+async def process_dataset_ai(id: str, payload: Optional[Dict[str, Any]] = None):
+    dataset = DatabaseService.get_dataset(id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+        
+    ai_model = SegmentationModel.get_instance()
+    if not ai_model.has_weights():
+        return {
+            "status": "AI MODEL NOT AVAILABLE — TRAINED MODEL WEIGHTS REQUIRED",
+            "detail": "AI model weights (.onnx or .pt) are not installed in backend/models/weights/. Real inference cannot be performed without a trained model.",
+            "weights_installed": False,
+            "dataset_id": id
+        }
+        
+    options = payload or {}
+    job = DatabaseService.create_job(id, options)
+    asyncio.create_task(ProcessingService.run_pipeline_job(job["id"], id, options))
+    return {
+        "job_id": job["id"],
+        "dataset_id": id,
+        "status": "running",
+        "current_stage": "UPLOAD",
+        "progress_pct": 5,
+        "eta_seconds": 40,
+        "eta_formatted": "00:40",
+        "weights_installed": True,
+        "model_name": ai_model.model_name
+    }
+
+@router.post("/datasets/compare")
+def compare_datasets(payload: Dict[str, Any]):
+    ref_id = payload.get("reference_dataset_id")
+    cur_id = payload.get("current_dataset_id")
+    
+    if not ref_id or not cur_id:
+        raise HTTPException(status_code=400, detail="Both 'reference_dataset_id' and 'current_dataset_id' are required.")
+        
+    ref = DatabaseService.get_dataset(ref_id)
+    cur = DatabaseService.get_dataset(cur_id)
+    
+    if not ref:
+        raise HTTPException(status_code=404, detail=f"Reference dataset '{ref_id}' not found.")
+    if not cur:
+        raise HTTPException(status_code=404, detail=f"Current dataset '{cur_id}' not found.")
+        
+    result = GeospatialService.compare_datasets(ref, cur)
+    return result
+
+@router.post("/datasets/temporal")
+def temporal_analysis(payload: Dict[str, Any]):
+    base_id = payload.get("baseline_dataset_id")
+    subs_id = payload.get("subsequent_dataset_id")
+    
+    if not base_id or not subs_id:
+        raise HTTPException(status_code=400, detail="Both 'baseline_dataset_id' and 'subsequent_dataset_id' are required.")
+        
+    base = DatabaseService.get_dataset(base_id)
+    subs = DatabaseService.get_dataset(subs_id)
+    
+    if not base:
+        raise HTTPException(status_code=404, detail=f"Baseline dataset '{base_id}' not found.")
+    if not subs:
+        raise HTTPException(status_code=404, detail=f"Subsequent dataset '{subs_id}' not found.")
+        
+    result = GeospatialService.temporal_analysis(base, subs)
+    return result
+
 # SECTION 14 SPECIFIC ENDPOINTS: /api/drone-imagery/*
 @router.get("/drone-imagery")
 def get_all_drone_imagery():
-    db_datasets = DatabaseService.get_datasets()
-    if db_datasets:
-        return db_datasets
-    return drone_missions_db
+    return DatabaseService.get_datasets()
 
 @router.post("/drone-imagery/upload")
 async def upload_drone_imagery_dataset(
@@ -915,17 +1788,17 @@ async def upload_drone_imagery_dataset(
             "storage_path": saved_meta["storage_path"],
             "file_size_bytes": saved_meta["file_size_bytes"],
             "file_size_str": saved_meta["file_size_str"],
-            "file_format": inspection.get("type", "GeoTIFF"),
+            "file_format": inspection.get("type", "Image"),
             "data_type": data_type,
-            "crs": inspection.get("crs", "EPSG:4326"),
-            "resolution": inspection.get("resolution", "5.0 cm / pixel"),
-            "gsd_cm": inspection.get("gsd_cm", 5.0),
-            "coverage_sqkm": inspection.get("coverage_sqkm", 4.2),
-            "coverage_str": inspection.get("coverage_str", "4.2 km²"),
+            "crs": inspection.get("crs") if inspection.get("is_georeferenced") else "Unreferenced Image",
+            "resolution": inspection.get("resolution") or "Not Available",
+            "gsd_cm": inspection.get("gsd_cm"),
+            "coverage_sqkm": inspection.get("coverage_sqkm"),
+            "coverage_str": inspection.get("coverage_str") or "Not Available",
             "width_px": inspection.get("width", 0),
             "height_px": inspection.get("height", 0),
             "bands": inspection.get("bands", 3),
-            "bounds": inspection.get("bounds", [[12.9740, 77.6340], [12.9840, 77.6460]]),
+            "bounds": inspection.get("bounds"),
             "metadata": {
                 "checklist": inspection.get("checklist", []),
                 "dimensions": inspection.get("dimensions", "0 × 0 px")
@@ -944,61 +1817,32 @@ async def upload_drone_imagery_dataset(
         )
         return dataset_record
 
-    # JSON fallback for presets or preloaded tests
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-        
-    filename = payload.get("filename", "survey_mission_orthomosaic.tif")
-    dataset_record = DatabaseService.create_dataset({
-        "id": dataset_id,
-        "name": payload.get("name", filename.replace(".tif", "").replace("_", " ").title()),
-        "original_filename": filename,
-        "storage_filename": filename,
-        "storage_path": "",
-        "file_size_bytes": payload.get("file_size_bytes", 2800000000),
-        "file_size_str": payload.get("filesize", "2.8 GB"),
-        "file_format": payload.get("format", "GeoTIFF"),
-        "data_type": payload.get("type", "Drone Orthomosaic"),
-        "crs": payload.get("crs", "EPSG:4326"),
-        "resolution": payload.get("resolution", "5 cm / pixel"),
-        "gsd_cm": payload.get("gsd_cm", 5.0),
-        "coverage_sqkm": 12.4,
-        "coverage_str": payload.get("coverage", "12.4 km²"),
-        "width_px": 28450,
-        "height_px": 19820,
-        "bands": 3,
-        "bounds": [[12.9740, 77.6340], [12.9840, 77.6460]],
-        "metadata": {
-            "dimensions": "28,450 × 19,820 px"
-        },
-        "preview_path": None,
-        "upload_status": "uploaded"
-    })
-    return dataset_record
+    # Multipart file is strictly required for real drone data processing
+    raise HTTPException(
+        status_code=400,
+        detail="Multipart file upload required. Please upload a real drone raster (JPG, JPEG, PNG, TIFF, GeoTIFF)."
+    )
+
+@router.get("/drone-imagery/active")
+def get_active_drone_imagery():
+    """Returns the most recent real uploaded drone dataset, or None."""
+    datasets = DatabaseService.get_datasets()
+    if not datasets:
+        return None
+    return datasets[0]
 
 @router.get("/drone-imagery/{id}")
 def get_drone_imagery_by_id(id: str):
     dataset = DatabaseService.get_dataset(id)
     if dataset:
         return dataset
-    for m in drone_missions_db:
-        if m.get("id") == id or m.get("ori_filename") == id or m.get("filename") == id:
-            return m
     raise HTTPException(status_code=404, detail="Dataset not found")
 
 @router.delete("/drone-imagery/{id}")
 def delete_drone_imagery_by_id(id: str):
     DroneUploadService.delete_dataset_files(id)
     deleted = DatabaseService.delete_dataset(id)
-    if not deleted:
-        # Check in mock db
-        for i, m in enumerate(drone_missions_db):
-            if m.get("id") == id:
-                drone_missions_db.pop(i)
-                return {"status": "deleted", "id": id}
-    return {"status": "deleted", "id": id}
+    return {"status": "deleted" if deleted else "not_found", "id": id}
 
 @router.post("/drone-imagery/{id}/validate")
 def validate_drone_imagery_by_id(id: str, payload: Optional[Dict[str, Any]] = None):
@@ -1023,37 +1867,13 @@ def validate_drone_imagery_by_id(id: str, payload: Optional[Dict[str, Any]] = No
                 "dimensions": inspection.get("dimensions", f"{dataset.get('width_px', 0)} × {dataset.get('height_px', 0)} px")
             }
         }
-        
-    return {
-        "dataset_id": id,
-        "overall_status": "Dataset Ready for AI Processing",
-        "checklist": [
-            {"name": "File integrity", "status": "Passed", "detail": "Header & compression checksum verified"},
-            {"name": "Coordinate Reference System", "status": "Passed", "detail": "EPSG:4326 / WGS 84 (UTM Zone 43N)"},
-            {"name": "Spatial extent", "status": "Passed", "detail": "BBox [12.9740, 77.6340, 12.9840, 77.6460]"},
-            {"name": "Ground Sampling Distance", "status": "Passed", "detail": "5 cm / pixel (Optimal for 1:500 Cadastral)"},
-            {"name": "Geo-referencing", "status": "Passed", "detail": "CORS RTK benchmarks validated within 2cm"},
-            {"name": "Image resolution", "status": "Passed", "detail": "28,450 × 19,820 px (564 Megapixels)"},
-            {"name": "Coverage boundary", "status": "Passed", "detail": "4.2 km² continuous polygon"},
-            {"name": "Metadata", "status": "Passed", "detail": "EXIF camera & timestamp tags intact"}
-        ],
-        "metrics": {
-            "crs": "EPSG:4326",
-            "gsd": "5 cm",
-            "coverage": "4.2 km²",
-            "dimensions": "28,450 × 19,820 px"
-        }
-    }
+    raise HTTPException(status_code=404, detail="Dataset not found or raster file missing on disk")
 
 @router.post("/drone-imagery/{id}/process")
 async def process_drone_imagery_by_id(id: str, payload: Optional[Dict[str, Any]] = None):
     dataset = DatabaseService.get_dataset(id)
     if not dataset:
-        dataset = DatabaseService.create_dataset({
-            "id": id,
-            "name": "Survey Mission Dataset",
-            "original_filename": "survey_dataset.tif"
-        })
+        raise HTTPException(status_code=404, detail=f"Dataset {id} not found. Please upload a real drone raster first.")
         
     options = payload or {}
     job = DatabaseService.create_job(id, options)
@@ -1090,6 +1910,7 @@ def get_drone_imagery_status(id: str):
             "logs": job.get("logs", []),
             "results": job.get("results"),
             "output_files": job.get("output_files", []),
+            "error": job.get("error_message"),
             "is_development_mode": ai_model.is_development_mode
         }
     return {
@@ -1147,11 +1968,32 @@ async def get_drone_imagery_events(id: str):
 @router.get("/drone-imagery/{id}/preview")
 def get_drone_imagery_preview(id: str):
     dataset = DatabaseService.get_dataset(id)
-    if dataset and dataset.get("preview_path") and os.path.exists(dataset["preview_path"]):
-        return FileResponse(dataset["preview_path"], media_type="image/png")
-    # Fallback to SVG placeholder if no file preview available
-    svg_content = '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600"><rect width="800" height="600" fill="#0f172a"/><text x="400" y="300" fill="#38bdf8" font-family="sans-serif" font-size="20" text-anchor="middle">Aerial Drone Imagery Coverage Extent</text></svg>'
-    return Response(content=svg_content, media_type="image/svg+xml")
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    
+    # 1. Use generated web preview if available
+    preview_path = dataset.get("preview_path")
+    if preview_path and os.path.exists(preview_path):
+        return FileResponse(preview_path, media_type="image/png")
+        
+    # 2. Use direct uploaded image if it is JPG/PNG
+    storage_path = dataset.get("storage_path")
+    if storage_path and os.path.exists(storage_path):
+        ext = os.path.splitext(storage_path.lower())[1]
+        if ext in [".png", ".jpg", ".jpeg"]:
+            media = "image/png" if ext == ".png" else "image/jpeg"
+            return FileResponse(storage_path, media_type=media)
+        elif ext in [".tif", ".tiff"]:
+            try:
+                from PIL import Image
+                with Image.open(storage_path) as img:
+                    prev_file = os.path.join(os.path.dirname(storage_path), "preview.png")
+                    img.convert("RGB").save(prev_file, "PNG")
+                    return FileResponse(prev_file, media_type="image/png")
+            except Exception:
+                pass
+                
+    raise HTTPException(status_code=404, detail="No preview available for this dataset")
 
 @router.get("/drone-imagery/{id}/results")
 def get_drone_imagery_results(id: str):
@@ -1160,24 +2002,26 @@ def get_drone_imagery_results(id: str):
     
     ai_model = AIModel.get_instance()
     results = job.get("results") if job else {}
-    db_stats = DatabaseService.get_dashboard_statistics()
-    buildings = DatabaseService.get_buildings()
-    roads = DatabaseService.get_roads()
+    parcels = DatabaseService.get_parcels() or []
+    buildings = DatabaseService.get_buildings() or []
+    roads = DatabaseService.get_roads() or []
+    conflicts = DatabaseService.get_conflicts() or []
     
     stats = results.get("stats") if (results and results.get("stats")) else {
-        "parcels_detected": db_stats.get("total_parcels", 14),
+        "parcels_detected": len(parcels),
         "buildings_extracted": len(buildings),
         "road_segments": len(roads),
-        "boundary_conflicts": db_stats.get("boundary_conflicts", 6),
-        "high_confidence_features": db_stats.get("high_confidence", 10),
-        "gt_verified": db_stats.get("gt_verified", 1)
+        "boundary_conflicts": len(conflicts),
+        "high_confidence_features": len([p for p in parcels if p.get("confidence_score") and float(p.get("confidence_score", 0)) >= 0.9]),
+        "gt_verified": len([p for p in parcels if p.get("status") in ["Human-verified", "Final", "Verified"]])
     }
     
     return {
         "dataset_id": id,
         "dataset_name": dataset.get("name") if dataset else "Drone Dataset",
         "status": job.get("status") if job else "completed",
-        "is_development_mode": ai_model.is_development_mode,
+        "model_status": ai_model.get_model_status(),
+        "has_weights": ai_model.has_weights(),
         "model_name": ai_model.model_name,
         "statistics": stats,
         "output_files": job.get("output_files", []) if job else []

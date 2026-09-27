@@ -119,7 +119,7 @@ class GroundTruthTask(BaseModel):
     status: str = "Open"  # "Open", "Assigned", "Survey In Progress", "Verified", "Rejected"
     gnss_accuracy_cm: float = 2.5
     cors_reference: str = "TN-CORS-Station-04"
-    coordinates: List[float] = [12.9716, 77.5946]
+    coordinates: Optional[List[float]] = None
     evidence_notes: str = "RTK GNSS boundary survey tied to state datum"
     evidence_files: List[str] = []
 
@@ -153,29 +153,29 @@ class AuditLogEntry(BaseModel):
 
 class AIExtractionJob(BaseModel):
     job_id: str
-    status: str = "Completed"  # "Pending", "Processing", "Completed", "Failed"
-    progress_pct: int = 100
+    status: str = "Pending"
+    progress_pct: int = 0
     drone_layer: str
-    ori_file: Optional[str] = "ORI_TechDistrict_2026.tif"
-    dsm_file: Optional[str] = "DSM_TechDistrict_5cm.tif"
-    dtm_file: Optional[str] = "DTM_BareEarth.tif"
-    extracted_parcels: int = 12486
-    extracted_buildings: int = 18742
-    extracted_roads: int = 1284
-    extracted_pathways: int = 3624
-    land_use_features: str = "Generated (98.4% coverage)"
+    ori_file: Optional[str] = None
+    dsm_file: Optional[str] = None
+    dtm_file: Optional[str] = None
+    extracted_parcels: int = 0
+    extracted_buildings: int = 0
+    extracted_roads: int = 0
+    extracted_pathways: int = 0
+    land_use_features: Optional[str] = None
 
 class Project(BaseModel):
     id: str
     name: str
     district: str
     state: str
-    crs: str = "EPSG:4326 / WGS 84"
+    crs: str = "Unreferenced Image"
     flight_date: str
-    resolution_cm: float = 5.0
-    total_parcels: int = 12486
-    ai_extracted: int = 11932
-    requires_review: int = 428
-    boundary_conflicts: int = 126
-    high_confidence: int = 10847
-    gt_verified: int = 8624
+    resolution_cm: Optional[float] = None
+    total_parcels: int = 0
+    ai_extracted: int = 0
+    requires_review: int = 0
+    boundary_conflicts: int = 0
+    high_confidence: int = 0
+    gt_verified: int = 0

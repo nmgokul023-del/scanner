@@ -59,6 +59,16 @@ def init_db():
                 metadata_json TEXT,
                 preview_path TEXT,
                 upload_status TEXT NOT NULL,
+                source_type TEXT DEFAULT 'drone_upload',
+                source_organization TEXT,
+                source_url TEXT,
+                acquisition_date TEXT,
+                date_accessed TEXT,
+                vector_geojson TEXT,
+                service_url TEXT,
+                affine_transform_json TEXT,
+                processing_status TEXT DEFAULT 'unprocessed',
+                layer_type TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -91,7 +101,7 @@ def init_db():
                 address TEXT NOT NULL,
                 zone TEXT NOT NULL,
                 status TEXT NOT NULL,
-                confidence_score REAL NOT NULL,
+                confidence_score REAL,
                 existing_area_sqm REAL NOT NULL,
                 ai_area_sqm REAL NOT NULL,
                 difference_sqm REAL NOT NULL,
@@ -112,6 +122,8 @@ def init_db():
                 dataset_id TEXT,
                 footprint_area_sqm REAL NOT NULL,
                 height_meters REAL NOT NULL,
+                relationship TEXT,
+                intersection_area_sqm REAL,
                 geometry_json TEXT NOT NULL
             )
         """)
@@ -124,6 +136,17 @@ def init_db():
                 width_meters REAL NOT NULL,
                 dataset_id TEXT,
                 geometry_json TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS land_use (
+                id TEXT PRIMARY KEY,
+                dataset_id TEXT,
+                category TEXT NOT NULL,
+                area_sqm REAL NOT NULL,
+                geometry_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
         """)
 
@@ -213,21 +236,81 @@ def init_db():
             )
         """)
         
-        # Migration: ensure is_active column exists
+        # Migration: ensure is_active column exists in users
         cursor.execute("PRAGMA table_info(users)")
         user_cols = [r["name"] for r in cursor.fetchall()]
         if "is_active" not in user_cols:
             cursor.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
 
+        # Migration: ensure relationship and intersection_area_sqm exist in buildings
+        cursor.execute("PRAGMA table_info(buildings)")
+        bld_cols = [r["name"] for r in cursor.fetchall()]
+        if "relationship" not in bld_cols:
+            cursor.execute("ALTER TABLE buildings ADD COLUMN relationship TEXT")
+        if "intersection_area_sqm" not in bld_cols:
+            cursor.execute("ALTER TABLE buildings ADD COLUMN intersection_area_sqm REAL")
+
+        # Migration: ensure confidence_score in parcels can be NULL (drop NOT NULL if present)
+        cursor.execute("PRAGMA table_info(parcels)")
+        parcels_info = {r["name"]: dict(r) for r in cursor.fetchall()}
+        if parcels_info.get("confidence_score") and parcels_info["confidence_score"].get("notnull") == 1:
+            try:
+                cursor.execute("""
+                    CREATE TABLE parcels_migrated (
+                        id TEXT PRIMARY KEY,
+                        parcel_id TEXT UNIQUE NOT NULL,
+                        title TEXT NOT NULL,
+                        address TEXT NOT NULL,
+                        zone TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        confidence_score REAL,
+                        existing_area_sqm REAL NOT NULL,
+                        ai_area_sqm REAL NOT NULL,
+                        difference_sqm REAL NOT NULL,
+                        suitability_score INTEGER NOT NULL,
+                        valuation_usd TEXT NOT NULL,
+                        dataset_id TEXT,
+                        geometry_json TEXT NOT NULL,
+                        existing_geometry_json TEXT,
+                        attributes_json TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                """)
+                cursor.execute("INSERT OR IGNORE INTO parcels_migrated SELECT * FROM parcels")
+                cursor.execute("DROP TABLE parcels")
+                cursor.execute("ALTER TABLE parcels_migrated RENAME TO parcels")
+            except Exception as mig_e:
+                print(f"Parcels migration notice: {mig_e}")
+
+        # Migration: ensure dataset_id column exists in ground_truth_tasks
+        cursor.execute("PRAGMA table_info(ground_truth_tasks)")
+        gt_cols = [r["name"] for r in cursor.fetchall()]
+        if "dataset_id" not in gt_cols:
+            cursor.execute("ALTER TABLE ground_truth_tasks ADD COLUMN dataset_id TEXT")
+
+        # Migration: ensure drone_datasets columns for Government / Open GIS and GeoTIFF
+        cursor.execute("PRAGMA table_info(drone_datasets)")
+        ds_cols = [r["name"] for r in cursor.fetchall()]
+        new_ds_cols = {
+            "source_type": "TEXT DEFAULT 'drone_upload'",
+            "source_organization": "TEXT",
+            "source_url": "TEXT",
+            "acquisition_date": "TEXT",
+            "date_accessed": "TEXT",
+            "vector_geojson": "TEXT",
+            "service_url": "TEXT",
+            "affine_transform_json": "TEXT",
+            "processing_status": "TEXT DEFAULT 'unprocessed'",
+            "layer_type": "TEXT"
+        }
+        for col_name, col_def in new_ds_cols.items():
+            if col_name not in ds_cols:
+                cursor.execute(f"ALTER TABLE drone_datasets ADD COLUMN {col_name} {col_def}")
+
         conn.commit()
 
-        cursor.execute("SELECT COUNT(*) FROM parcels")
-        if cursor.fetchone()[0] == 0:
-            seed_initial_data(conn)
-        else:
-            seed_ground_truth_if_needed(conn)
-            seed_change_detections_if_needed(conn)
-
+        # Pure Real Mode: Do NOT seed mock parcels, buildings, roads, or conflicts.
+        # Database only contains real uploaded datasets and user actions.
         seed_users_if_needed(conn)
 
 def seed_users_if_needed(conn: sqlite3.Connection):
@@ -255,120 +338,34 @@ def seed_users_if_needed(conn: sqlite3.Connection):
     except Exception as e:
         print(f"Error seeding users: {e}")
 
-def seed_change_detections_if_needed(conn: sqlite3.Connection):
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM change_detections")
-        if cursor.fetchone()[0] == 0:
-            from backend.data.mock_db import MOCK_CHANGE_DETECTION
-            for chg in MOCK_CHANGE_DETECTION:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO change_detections (
-                        id, parcel_id, feature_type, date_a, date_b, change_description, geometry_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    chg["id"], chg["parcel_id"], chg["feature_type"], chg["date_a"],
-                    chg["date_b"], chg["change_description"], json.dumps(chg["geometry"])
-                ))
-            conn.commit()
-    except Exception as e:
-        print(f"Error seeding change detections: {e}")
-
-def seed_ground_truth_if_needed(conn: sqlite3.Connection):
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM ground_truth_tasks")
-        if cursor.fetchone()[0] == 0:
-            from backend.data.mock_db import MOCK_GROUND_TRUTH_TASKS
-            now = datetime.now().isoformat()
-            for t in MOCK_GROUND_TRUTH_TASKS:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO ground_truth_tasks (
-                        id, parcel_id, task_id, reason, surveyor, status,
-                        gnss_accuracy_cm, cors_reference, coordinates_json,
-                        evidence_notes, evidence_files_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    t["id"], t["parcel_id"], t["task_id"], t["reason"], t["surveyor"],
-                    t.get("status", "Open"), t.get("gnss_accuracy_cm", 1.5),
-                    t.get("cors_reference", "TN-CORS-KA-04"),
-                    json.dumps(t.get("coordinates", [12.9785, 77.6412])),
-                    t.get("evidence_notes", ""),
-                    json.dumps(t.get("evidence_files", [])),
-                    now, now
-                ))
-            conn.commit()
-    except Exception as e:
-        print(f"Error seeding ground truth tasks: {e}")
-
-def seed_initial_data(conn: sqlite3.Connection):
-    try:
-        from backend.data.mock_db import (
-            MOCK_PARCELS, MOCK_BUILDINGS, MOCK_ROADS, MOCK_CONFLICTS, MOCK_AUDIT_LOGS
-        )
-        cursor = conn.cursor()
-        now = datetime.now().isoformat()
-        
-        for p in MOCK_PARCELS:
-            cursor.execute("""
-                INSERT OR IGNORE INTO parcels (
-                    id, parcel_id, title, address, zone, status, confidence_score,
-                    existing_area_sqm, ai_area_sqm, difference_sqm, suitability_score,
-                    valuation_usd, dataset_id, geometry_json, existing_geometry_json,
-                    attributes_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                p["id"], p["parcel_id"], p["title"], p["address"], p["zone"], p["status"],
-                p["confidence_score"], p["existing_area_sqm"], p["ai_area_sqm"], p["difference_sqm"],
-                p["suitability_score"], p["valuation_usd"], None,
-                json.dumps(p["geometry"]),
-                json.dumps(p.get("existing_geometry")) if p.get("existing_geometry") else None,
-                json.dumps(p),
-                now
-            ))
-            
-        for b in MOCK_BUILDINGS:
-            cursor.execute("""
-                INSERT OR IGNORE INTO buildings (id, parcel_id, dataset_id, footprint_area_sqm, height_meters, geometry_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (b["id"], b.get("parcel_id"), None, b["footprint_area_sqm"], b["height_meters"], json.dumps(b["geometry"])))
-
-        for r in MOCK_ROADS:
-            cursor.execute("""
-                INSERT OR IGNORE INTO roads (id, name, road_type, width_meters, dataset_id, geometry_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (r["id"], r["name"], r["road_type"], r["width_meters"], None, json.dumps(r["geometry"])))
-
-        for c in MOCK_CONFLICTS:
-            cursor.execute("""
-                INSERT OR IGNORE INTO conflicts (id, parcel_id, conflict_type, difference_sqm, severity, status, description, dataset_id, geometry_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (c["id"], c["parcel_id"], c["conflict_type"], c["difference_sqm"], c["severity"], c.get("status", "Active"), c.get("description", ""), None, json.dumps(c["geometry"])))
-
-        for a in MOCK_AUDIT_LOGS:
-            cursor.execute("""
-                INSERT OR IGNORE INTO audit_logs (id, timestamp, user, action, parcel_id, previous_state, new_state, details)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (a["id"], a["timestamp"], a["user"], a["action"], a.get("parcel_id"), a.get("previous_state"), a.get("new_state"), a.get("details")))
-
-        conn.commit()
-    except Exception as e:
-        print(f"Error seeding database: {e}")
-
 class DatabaseService:
     @staticmethod
-    def get_datasets() -> List[Dict[str, Any]]:
+    def get_datasets(source_type: Optional[str] = None) -> List[Dict[str, Any]]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM drone_datasets ORDER BY created_at DESC")
+            if source_type:
+                cursor.execute("SELECT * FROM drone_datasets WHERE source_type = ? ORDER BY created_at DESC", (source_type,))
+            else:
+                cursor.execute("SELECT * FROM drone_datasets ORDER BY created_at DESC")
             rows = cursor.fetchall()
             result = []
             for r in rows:
                 item = dict(r)
                 if item.get("bounds_json"):
-                    item["bounds"] = json.loads(item["bounds_json"])
+                    try:
+                        item["bounds"] = json.loads(item["bounds_json"])
+                    except Exception:
+                        item["bounds"] = None
                 if item.get("metadata_json"):
-                    item["metadata"] = json.loads(item["metadata_json"])
+                    try:
+                        item["metadata"] = json.loads(item["metadata_json"])
+                    except Exception:
+                        item["metadata"] = {}
+                if item.get("affine_transform_json"):
+                    try:
+                        item["affine_transform"] = json.loads(item["affine_transform_json"])
+                    except Exception:
+                        item["affine_transform"] = None
                 result.append(item)
             return result
 
@@ -382,9 +379,20 @@ class DatabaseService:
                 return None
             item = dict(row)
             if item.get("bounds_json"):
-                item["bounds"] = json.loads(item["bounds_json"])
+                try:
+                    item["bounds"] = json.loads(item["bounds_json"])
+                except Exception:
+                    item["bounds"] = None
             if item.get("metadata_json"):
-                item["metadata"] = json.loads(item["metadata_json"])
+                try:
+                    item["metadata"] = json.loads(item["metadata_json"])
+                except Exception:
+                    item["metadata"] = {}
+            if item.get("affine_transform_json"):
+                try:
+                    item["affine_transform"] = json.loads(item["affine_transform_json"])
+                except Exception:
+                    item["affine_transform"] = None
             return item
 
     @staticmethod
@@ -399,8 +407,11 @@ class DatabaseService:
                     file_size_bytes, file_size_str, file_format, data_type,
                     crs, resolution, gsd_cm, coverage_sqkm, coverage_str,
                     width_px, height_px, bands, bounds_json, metadata_json,
-                    preview_path, upload_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    preview_path, upload_status, source_type, source_organization,
+                    source_url, acquisition_date, date_accessed, vector_geojson,
+                    service_url, affine_transform_json, processing_status, layer_type,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 dataset_id,
                 data.get("name", data.get("original_filename", "Dataset")),
@@ -409,25 +420,108 @@ class DatabaseService:
                 data.get("storage_path", ""),
                 data.get("file_size_bytes", 0),
                 data.get("file_size_str", "0 MB"),
-                data.get("file_format", "GeoTIFF"),
+                data.get("file_format", "Image"),
                 data.get("data_type", "Drone Orthomosaic"),
-                data.get("crs", "EPSG:4326"),
-                data.get("resolution", "5 cm / pixel"),
-                data.get("gsd_cm", 5.0),
-                data.get("coverage_sqkm", 4.2),
-                data.get("coverage_str", "4.2 km²"),
+                data.get("crs") or "Unreferenced Image",
+                data.get("resolution") or "Not Available",
+                data.get("gsd_cm"),
+                data.get("coverage_sqkm"),
+                data.get("coverage_str") or "Not Available",
                 data.get("width_px", 0),
                 data.get("height_px", 0),
                 data.get("bands", 3),
-                json.dumps(data.get("bounds", [[12.9740, 77.6340], [12.9840, 77.6460]])),
+                json.dumps(data.get("bounds")) if data.get("bounds") is not None else None,
                 json.dumps(data.get("metadata", {})),
                 data.get("preview_path", None),
                 data.get("upload_status", "uploaded"),
+                data.get("source_type", "drone_upload"),
+                data.get("source_organization"),
+                data.get("source_url"),
+                data.get("acquisition_date"),
+                data.get("date_accessed"),
+                data.get("vector_geojson"),
+                data.get("service_url"),
+                json.dumps(data.get("affine_transform")) if data.get("affine_transform") is not None else None,
+                data.get("processing_status", "unprocessed"),
+                data.get("layer_type"),
                 now,
                 now
             ))
             conn.commit()
             return DatabaseService.get_dataset(dataset_id)
+
+    @staticmethod
+    def get_dataset_layers(dataset_id: str) -> Dict[str, Any]:
+        dataset = DatabaseService.get_dataset(dataset_id)
+        if not dataset:
+            return {"success": False, "error": "Dataset not found", "layers": []}
+        
+        layers = []
+        source_type = dataset.get("source_type", "drone_upload")
+        layer_type = dataset.get("layer_type") or ("vector" if dataset.get("vector_geojson") else "raster")
+        
+        if layer_type == "vector" or dataset.get("vector_geojson"):
+            geojson_data = None
+            if dataset.get("vector_geojson"):
+                try:
+                    geojson_data = json.loads(dataset["vector_geojson"])
+                except Exception:
+                    geojson_data = None
+            
+            feature_count = len(geojson_data.get("features", [])) if geojson_data and "features" in geojson_data else 0
+            layers.append({
+                "id": f"{dataset_id}-vector",
+                "name": dataset.get("name", "Vector Layer"),
+                "type": "vector",
+                "source_type": source_type,
+                "source_organization": dataset.get("source_organization", "Reference GIS"),
+                "crs": dataset.get("crs", "EPSG:4326"),
+                "bounds": dataset.get("bounds"),
+                "geojson": geojson_data,
+                "feature_count": feature_count,
+                "is_active": True,
+                "visible": True,
+                "opacity": 1.0
+            })
+        elif dataset.get("service_url"):
+            layers.append({
+                "id": f"{dataset_id}-service",
+                "name": dataset.get("name", "OGC Service"),
+                "type": "wms" if "wms" in dataset.get("file_format", "").lower() else "wfs",
+                "source_type": source_type,
+                "source_organization": dataset.get("source_organization"),
+                "service_url": dataset.get("service_url"),
+                "crs": dataset.get("crs", "EPSG:4326"),
+                "bounds": dataset.get("bounds"),
+                "is_active": True,
+                "visible": True,
+                "opacity": 0.8
+            })
+        else:
+            layers.append({
+                "id": f"{dataset_id}-raster",
+                "name": dataset.get("name", "Raster Imagery"),
+                "type": "raster",
+                "source_type": source_type,
+                "crs": dataset.get("crs", "Unreferenced Image"),
+                "bounds": dataset.get("bounds"),
+                "preview_url": f"/api/drone-imagery/{dataset_id}/preview" if dataset.get("preview_path") else None,
+                "resolution": dataset.get("resolution"),
+                "gsd_cm": dataset.get("gsd_cm"),
+                "is_active": True,
+                "visible": True,
+                "opacity": 0.85
+            })
+            
+        return {
+            "success": True,
+            "dataset_id": dataset_id,
+            "dataset_name": dataset.get("name"),
+            "source_type": source_type,
+            "crs": dataset.get("crs"),
+            "bounds": dataset.get("bounds"),
+            "layers": layers
+        }
 
     @staticmethod
     def update_dataset(dataset_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -437,7 +531,7 @@ class DatabaseService:
             fields = []
             values = []
             for k, v in updates.items():
-                if k in ("bounds", "metadata"):
+                if k in ("bounds", "metadata", "affine_transform"):
                     fields.append(f"{k}_json = ?")
                     values.append(json.dumps(v))
                 else:
@@ -549,11 +643,19 @@ class DatabaseService:
             return DatabaseService.get_job(job_id)
 
     @staticmethod
-    def get_parcels(search=None, zone=None, status=None) -> List[Dict[str, Any]]:
+    def get_parcels(search=None, zone=None, status=None, dataset_id: Optional[str] = None, mode: str = "real") -> List[Dict[str, Any]]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             query = "SELECT * FROM parcels WHERE 1=1"
             params = []
+            if dataset_id:
+                query += " AND dataset_id = ?"
+                params.append(dataset_id)
+            elif mode == "real":
+                query += " AND dataset_id IS NOT NULL AND dataset_id != ''"
+            elif mode == "demo":
+                query += " AND (dataset_id IS NULL OR dataset_id = '')"
+
             if search:
                 s = f"%{search.lower()}%"
                 query += " AND (LOWER(parcel_id) LIKE ? OR LOWER(address) LIKE ? OR LOWER(title) LIKE ?)"
@@ -617,14 +719,81 @@ class DatabaseService:
         return DatabaseService.get_parcel_by_id(parcel_id)
 
     @staticmethod
-    def get_buildings() -> List[Dict[str, Any]]:
+    def create_parcel(parcel_data: Dict[str, Any]) -> Dict[str, Any]:
+        p_id = parcel_data.get("id") or f"p-{uuid.uuid4().hex[:6]}"
+        pid = parcel_data.get("parcel_id") or f"88{uuid.uuid4().hex[:2].upper()}-A"
+        geom = parcel_data.get("geometry", {})
+        existing_geom = parcel_data.get("existing_geometry")
+        now = datetime.now().isoformat()
+        
+        # Calculate real area if not provided
+        area_sqm = parcel_data.get("ai_area_sqm") or parcel_data.get("existing_area_sqm")
+        if not area_sqm and geom:
+            from backend.services.topology_service import TopologyValidationService
+            area_sqm = TopologyValidationService.calculate_polygon_area_sqm(geom)
+        area_sqm = round(area_sqm or 1000.0, 2)
+
+        conf_score = parcel_data.get("confidence_score")
+        if conf_score is not None:
+            try:
+                conf_score = float(conf_score)
+            except (ValueError, TypeError):
+                conf_score = None
+
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM buildings")
+            cursor.execute("""
+                INSERT OR REPLACE INTO parcels (
+                    id, parcel_id, title, address, zone, status, confidence_score,
+                    existing_area_sqm, ai_area_sqm, difference_sqm, suitability_score,
+                    valuation_usd, dataset_id, geometry_json, existing_geometry_json,
+                    attributes_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                p_id,
+                pid,
+                parcel_data.get("title", f"Parcel #{pid} • Sector 4B"),
+                parcel_data.get("address", f"Survey Sector 4B, Plot {pid}"),
+                parcel_data.get("zone", "M-2"),
+                parcel_data.get("status", "AI-generated (Probable)"),
+                conf_score,
+                float(parcel_data.get("existing_area_sqm", area_sqm)),
+                float(area_sqm),
+                float(parcel_data.get("difference_sqm", 0.0)),
+                int(parcel_data.get("suitability_score", 90)),
+                str(parcel_data.get("valuation_usd", f"${round(area_sqm * 1800 / 1000000, 1)}M")),
+                parcel_data.get("dataset_id") or "surveyor-digitized",
+                json.dumps(geom),
+                json.dumps(existing_geom) if existing_geom else None,
+                json.dumps(parcel_data.get("attributes", {})),
+                now
+            ))
+            conn.commit()
+        return DatabaseService.get_parcel_by_id(p_id)
+
+    @staticmethod
+    def delete_parcel(parcel_id: str) -> bool:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM parcels WHERE id = ? OR parcel_id = ?", (parcel_id, parcel_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def get_buildings(dataset_id: Optional[str] = None, mode: str = "real") -> List[Dict[str, Any]]:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM buildings WHERE 1=1"
+            params = []
+            if dataset_id:
+                query += " AND dataset_id = ?"
+                params.append(dataset_id)
+            elif mode == "real":
+                query += " AND dataset_id IS NOT NULL AND dataset_id != ''"
+            elif mode == "demo":
+                query += " AND (dataset_id IS NULL OR dataset_id = '')"
+            cursor.execute(query, params)
             rows = cursor.fetchall()
-            if not rows:
-                from backend.data.mock_db import MOCK_BUILDINGS
-                return MOCK_BUILDINGS
             buildings = []
             for r in rows:
                 b = dict(r)
@@ -633,14 +802,20 @@ class DatabaseService:
             return buildings
 
     @staticmethod
-    def get_roads() -> List[Dict[str, Any]]:
+    def get_roads(dataset_id: Optional[str] = None, mode: str = "real") -> List[Dict[str, Any]]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM roads")
+            query = "SELECT * FROM roads WHERE 1=1"
+            params = []
+            if dataset_id:
+                query += " AND dataset_id = ?"
+                params.append(dataset_id)
+            elif mode == "real":
+                query += " AND dataset_id IS NOT NULL AND dataset_id != ''"
+            elif mode == "demo":
+                query += " AND (dataset_id IS NULL OR dataset_id = '')"
+            cursor.execute(query, params)
             rows = cursor.fetchall()
-            if not rows:
-                from backend.data.mock_db import MOCK_ROADS
-                return MOCK_ROADS
             roads = []
             for r in rows:
                 rd = dict(r)
@@ -649,17 +824,23 @@ class DatabaseService:
             return roads
 
     @staticmethod
-    def get_conflicts(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_conflicts(status: Optional[str] = None, dataset_id: Optional[str] = None, mode: str = "real") -> List[Dict[str, Any]]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
+            query = "SELECT * FROM conflicts WHERE 1=1"
+            params = []
             if status:
-                cursor.execute("SELECT * FROM conflicts WHERE status = ?", (status,))
-            else:
-                cursor.execute("SELECT * FROM conflicts")
+                query += " AND status = ?"
+                params.append(status)
+            if dataset_id:
+                query += " AND dataset_id = ?"
+                params.append(dataset_id)
+            elif mode == "real":
+                query += " AND dataset_id IS NOT NULL AND dataset_id != ''"
+            elif mode == "demo":
+                query += " AND (dataset_id IS NULL OR dataset_id = '')"
+            cursor.execute(query, params)
             rows = cursor.fetchall()
-            if not rows and not status:
-                from backend.data.mock_db import MOCK_CONFLICTS
-                return MOCK_CONFLICTS
             conflicts = []
             for r in rows:
                 c = dict(r)
@@ -703,6 +884,53 @@ class DatabaseService:
         return DatabaseService.get_conflict(conflict_id)
 
     @staticmethod
+    def save_conflict(conflict_data: Dict[str, Any]) -> Dict[str, Any]:
+        c_id = conflict_data.get("id") or f"cnf-{uuid.uuid4().hex[:6]}"
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO conflicts (
+                    id, parcel_id, conflict_type, difference_sqm, severity, status, description, dataset_id, geometry_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                c_id,
+                conflict_data.get("parcel_id", "Unknown"),
+                conflict_data.get("conflict_type", "Boundary Overlap"),
+                float(conflict_data.get("difference_sqm", 0.0)),
+                conflict_data.get("severity", "High"),
+                conflict_data.get("status", "Active"),
+                conflict_data.get("description", "Topology discrepancy detected"),
+                conflict_data.get("dataset_id"),
+                json.dumps(conflict_data.get("geometry", {}))
+            ))
+            conn.commit()
+        return DatabaseService.get_conflict(c_id)
+
+    @staticmethod
+    def clear_and_replace_conflicts(conflicts: List[Dict[str, Any]]):
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM conflicts")
+            for c in conflicts:
+                c_id = c.get("id") or f"cnf-{uuid.uuid4().hex[:6]}"
+                cursor.execute("""
+                    INSERT INTO conflicts (
+                        id, parcel_id, conflict_type, difference_sqm, severity, status, description, dataset_id, geometry_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    c_id,
+                    c.get("parcel_id", "Unknown"),
+                    c.get("conflict_type", "Boundary Overlap"),
+                    float(c.get("difference_sqm", 0.0)),
+                    c.get("severity", "High"),
+                    c.get("status", "Active"),
+                    c.get("description", "Topology discrepancy detected"),
+                    c.get("dataset_id"),
+                    json.dumps(c.get("geometry", {}))
+                ))
+            conn.commit()
+
+    @staticmethod
     def get_audit_logs() -> List[Dict[str, Any]]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -738,9 +966,6 @@ class DatabaseService:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM change_detections")
             rows = cursor.fetchall()
-            if not rows:
-                from backend.data.mock_db import MOCK_CHANGE_DETECTION
-                return MOCK_CHANGE_DETECTION
             changes = []
             for r in rows:
                 chg = dict(r)
@@ -768,12 +993,62 @@ class DatabaseService:
             return tasks
 
     @staticmethod
-    def add_extracted_features(dataset_id: str, parcels: list, buildings: list, roads: list, conflicts: list):
+    def save_land_use(dataset_id: str, land_use_features: list):
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+            for lu in land_use_features:
+                lu_id = lu.get("id") or f"lu-{uuid.uuid4().hex[:6]}"
+                cursor.execute("""
+                    INSERT OR REPLACE INTO land_use (id, dataset_id, category, area_sqm, geometry_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    lu_id,
+                    dataset_id,
+                    lu.get("category", "Vegetation"),
+                    float(lu.get("area_sqm") or 0.0),
+                    json.dumps(lu.get("geometry", {})),
+                    now
+                ))
+            conn.commit()
+
+    @staticmethod
+    def get_land_use(dataset_id: Optional[str] = None, mode: str = "real") -> List[Dict[str, Any]]:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM land_use WHERE 1=1"
+            params = []
+            if dataset_id:
+                query += " AND dataset_id = ?"
+                params.append(dataset_id)
+            elif mode == "real":
+                query += " AND dataset_id IS NOT NULL AND dataset_id != ''"
+            elif mode == "demo":
+                query += " AND (dataset_id IS NULL OR dataset_id = '')"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            result = []
+            for r in rows:
+                item = dict(r)
+                if item.get("geometry_json"):
+                    item["geometry"] = json.loads(item["geometry_json"])
+                result.append(item)
+            return result
+
+    @staticmethod
+    def add_extracted_features(dataset_id: str, parcels: list, buildings: list, roads: list, conflicts: list, land_use: Optional[list] = None):
         with get_db_connection() as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
             
             for p in parcels:
+                conf_score = p.get("confidence_score")
+                if conf_score is not None:
+                    try:
+                        conf_score = float(conf_score)
+                    except (ValueError, TypeError):
+                        conf_score = None
+
                 cursor.execute("""
                     INSERT OR REPLACE INTO parcels (
                         id, parcel_id, title, address, zone, status, confidence_score,
@@ -786,14 +1061,14 @@ class DatabaseService:
                     p["parcel_id"],
                     p.get("title", f"Parcel {p['parcel_id']}"),
                     p.get("address", "Sector Survey Extent"),
-                    p.get("zone", "M-2"),
-                    p.get("status", "AI Extracted"),
-                    p.get("confidence_score", 0.94),
-                    p.get("existing_area_sqm", p.get("ai_area_sqm", 1250)),
-                    p.get("ai_area_sqm", 1250),
+                    p.get("zone", "Unclassified Zone"),
+                    p.get("status", "AI-Generated Preliminary Parcel Boundary"),
+                    conf_score,
+                    p.get("existing_area_sqm"),
+                    p.get("ai_area_sqm"),
                     p.get("difference_sqm", 0.0),
-                    p.get("suitability_score", 92),
-                    p.get("valuation_usd", "$1.4M"),
+                    p.get("suitability_score"),
+                    p.get("valuation_usd", "Not Available"),
                     dataset_id,
                     json.dumps(p["geometry"]),
                     json.dumps(p.get("existing_geometry")) if p.get("existing_geometry") else None,
@@ -803,14 +1078,16 @@ class DatabaseService:
 
             for b in buildings:
                 cursor.execute("""
-                    INSERT INTO buildings (id, parcel_id, dataset_id, footprint_area_sqm, height_meters, geometry_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO buildings (id, parcel_id, dataset_id, footprint_area_sqm, height_meters, relationship, intersection_area_sqm, geometry_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     b.get("id", f"bld-{uuid.uuid4().hex[:6]}"),
                     b.get("parcel_id"),
                     dataset_id,
-                    b.get("footprint_area_sqm", 250),
-                    b.get("height_meters", 12.5),
+                    b.get("footprint_area_sqm"),
+                    b.get("height_meters"),
+                    b.get("relationship", "none"),
+                    b.get("intersection_area_sqm", 0.0),
                     json.dumps(b["geometry"])
                 ))
 
@@ -820,9 +1097,9 @@ class DatabaseService:
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (
                     r.get("id", f"rd-{uuid.uuid4().hex[:6]}"),
-                    r.get("name", "Access Corridor"),
-                    r.get("road_type", "Primary Road"),
-                    r.get("width_meters", 15.0),
+                    r.get("name", "Extracted Road Corridor"),
+                    r.get("road_type", "Drone Extracted Road"),
+                    r.get("width_meters"),
                     dataset_id,
                     json.dumps(r["geometry"])
                 ))
@@ -845,26 +1122,32 @@ class DatabaseService:
 
             conn.commit()
 
+        if land_use:
+            DatabaseService.save_land_use(dataset_id, land_use)
+
     @staticmethod
-    def get_dashboard_statistics() -> Dict[str, Any]:
+    def get_dashboard_statistics(mode: str = "real") -> Dict[str, Any]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM parcels")
+            cond = " WHERE dataset_id IS NOT NULL AND dataset_id != ''" if mode == "real" else (" WHERE (dataset_id IS NULL OR dataset_id = '')" if mode == "demo" else "")
+            and_cond = " AND dataset_id IS NOT NULL AND dataset_id != ''" if mode == "real" else (" AND (dataset_id IS NULL OR dataset_id = '')" if mode == "demo" else "")
+
+            cursor.execute(f"SELECT COUNT(*) FROM parcels{cond}")
             total_parcels = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(*) FROM parcels WHERE confidence_score >= 0.90")
+            cursor.execute(f"SELECT COUNT(*) FROM parcels WHERE confidence_score >= 0.90{and_cond}")
             high_conf = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM parcels WHERE status IN ('Verified', 'Ground-Truth Calibrated', 'Ground Truth Verified') OR status LIKE '%Verified%'")
+            cursor.execute(f"SELECT COUNT(*) FROM parcels WHERE (status IN ('Verified', 'Ground-Truth Calibrated', 'Ground Truth Verified', 'Human Verified') OR status LIKE '%Verified%'){and_cond}")
             gt_verified = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM parcels WHERE status IN ('Requires Verification', 'Conflict Detected', 'Flagged Discrepancy')")
+            cursor.execute(f"SELECT COUNT(*) FROM parcels WHERE status IN ('Requires Verification', 'Conflict Detected', 'Flagged Discrepancy'){and_cond}")
             requires_review = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM conflicts WHERE status != 'Resolved'")
+            cursor.execute(f"SELECT COUNT(*) FROM conflicts WHERE status != 'Resolved'{and_cond}")
             boundary_conflicts = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM parcels WHERE status != 'Pending'")
+            cursor.execute(f"SELECT COUNT(*) FROM parcels WHERE status != 'Pending'{and_cond}")
             ai_extracted = cursor.fetchone()[0]
 
             return {
@@ -873,18 +1156,25 @@ class DatabaseService:
                 "requires_review": requires_review,
                 "boundary_conflicts": boundary_conflicts,
                 "high_confidence": high_conf,
-                "gt_verified": gt_verified
+                "gt_verified": gt_verified,
+                "mode": mode
             }
 
     @staticmethod
-    def get_ground_truth_tasks() -> List[Dict[str, Any]]:
+    def get_ground_truth_tasks(mode: str = "real") -> List[Dict[str, Any]]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM ground_truth_tasks ORDER BY created_at DESC")
+            query = "SELECT * FROM ground_truth_tasks WHERE 1=1"
+            if mode == "real":
+                query += " AND dataset_id IS NOT NULL AND dataset_id != ''"
+            elif mode == "demo":
+                query += " AND (dataset_id IS NULL OR dataset_id = '')"
+            query += " ORDER BY created_at DESC"
+            cursor.execute(query)
             tasks = []
             for row in cursor.fetchall():
                 t = dict(row)
-                t["coordinates"] = json.loads(t["coordinates_json"]) if t.get("coordinates_json") else [12.9785, 77.6412]
+                t["coordinates"] = json.loads(t["coordinates_json"]) if t.get("coordinates_json") else None
                 t["evidence_files"] = json.loads(t["evidence_files_json"]) if t.get("evidence_files_json") else []
                 cursor.execute(
                     "SELECT * FROM ground_truth_evidence WHERE task_id = ? OR task_id = ? ORDER BY uploaded_at ASC",
@@ -903,7 +1193,7 @@ class DatabaseService:
             if not row:
                 return None
             t = dict(row)
-            t["coordinates"] = json.loads(t["coordinates_json"]) if t.get("coordinates_json") else [12.9785, 77.6412]
+            t["coordinates"] = json.loads(t["coordinates_json"]) if t.get("coordinates_json") else None
             t["evidence_files"] = json.loads(t["evidence_files_json"]) if t.get("evidence_files_json") else []
             cursor.execute(
                 "SELECT * FROM ground_truth_evidence WHERE task_id = ? OR task_id = ? ORDER BY uploaded_at ASC",
@@ -919,7 +1209,7 @@ class DatabaseService:
             task_id = data.get("task_id") or f"GT-TASK-2026-{uuid.uuid4().hex[:3].upper()}"
             record_id = data.get("id") or f"gt-{uuid.uuid4().hex[:4]}"
             now = datetime.now().isoformat()
-            coords = data.get("coordinates", [12.9785, 77.6410])
+            coords = data.get("coordinates")
             files = data.get("evidence_files", [])
 
             cursor.execute("""
@@ -1121,4 +1411,4 @@ class DatabaseService:
 
 init_db()
 
-
+db_service = DatabaseService

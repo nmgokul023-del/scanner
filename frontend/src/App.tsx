@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Parcel, Conflict, GroundTruthTask, ChangeDetectionItem, TopologyIssue, Project, Building, Road } from './types';
+import { Parcel, Conflict, GroundTruthTask, ChangeDetectionItem, TopologyIssue, Project, Building, Road, LandUseFeature } from './types';
 import { apiClient } from './api/client';
 import { Navbar } from './components/layout/Navbar';
 import { Sidebar } from './components/layout/Sidebar';
@@ -22,13 +22,38 @@ import { GISEditor } from './pages/GISEditor';
 import { Reports } from './pages/Reports';
 import { AuditLog } from './pages/AuditLog';
 import { GenericGISList } from './pages/GenericGISList';
-import { DroneUploadPipeline } from './pages/DroneUploadPipeline';
 import { DroneImageryUpload } from './pages/DroneImageryUpload';
+import { GISErrorBoundary } from './components/common/GISErrorBoundary';
+import { Building as BuildingIcon, CheckSquare } from 'lucide-react';
 
+
+const getInitialRoute = (): string => {
+  if (typeof window === 'undefined') return 'dashboard';
+  const path = window.location.pathname.replace(/^\/+/, '').split('/')[0] || '';
+  const validRoutes = [
+    'dashboard', 'insights', 'projects', 'drone-imagery', 'ai-extraction',
+    'parcel-map', 'property-details', 'buildings', 'roads', 'land-use',
+    'conflicts', 'confidence', 'verification', 'ground-truth', 'change-detection',
+    'topology', 'gis-editor', 'reports', 'audit', 'settings'
+  ];
+  if (validRoutes.includes(path)) {
+    return path;
+  }
+  return 'dashboard';
+};
 
 export function App() {
-  const [currentUser, setCurrentUser] = useState<any>(null);
-  const [currentRoute, setCurrentRoute] = useState<string>('dashboard');
+  const [currentUser, setCurrentUser] = useState<any>(() => {
+    try {
+      const token = localStorage.getItem('cadastral_auth_token');
+      const cached = localStorage.getItem('cadastral_auth_user');
+      if (token && cached) {
+        return JSON.parse(cached);
+      }
+    } catch (e) {}
+    return null;
+  });
+  const [currentRoute, setCurrentRoute] = useState<string>(getInitialRoute);
   const [currentProject, setCurrentProject] = useState<string>('Tech District Phase II');
   
   const [parcels, setParcels] = useState<Parcel[]>([]);
@@ -39,6 +64,7 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [roads, setRoads] = useState<Road[]>([]);
+  const [landUse, setLandUse] = useState<LandUseFeature[]>([]);
   
   const [selectedParcel, setSelectedParcel] = useState<Parcel | null>(null);
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
@@ -46,61 +72,70 @@ export function App() {
   const [acquisitionModalParcel, setAcquisitionModalParcel] = useState<Parcel | null>(null);
   const [acquisitionSubmitted, setAcquisitionSubmitted] = useState(false);
 
+  const [gisMode, setGisMode] = useState<'real' | 'demo'>('real');
+  const [activeDataset, setActiveDataset] = useState<any>(null);
+
   // Dynamic dashboard stats from database
   const [dashboardStats, setDashboardStats] = useState<any>({
-    total_parcels: 14,
-    ai_extracted: 14,
-    requires_review: 4,
-    boundary_conflicts: 6,
-    high_confidence: 10,
-    gt_verified: 1
+    total_parcels: 0,
+    ai_extracted: 0,
+    requires_review: 0,
+    boundary_conflicts: 0,
+    high_confidence: 0,
+    gt_verified: 0
   });
 
   const handleDatasetProcessed = (stats: any) => {
     if (stats) {
       setDashboardStats({
-        total_parcels: stats.parcels_detected || 14,
-        ai_extracted: stats.parcels_detected || 14,
-        requires_review: stats.requires_review || 4,
-        boundary_conflicts: stats.boundary_conflicts || 6,
-        high_confidence: stats.high_confidence_features || 10,
-        gt_verified: stats.gt_verified || 1
+        total_parcels: stats.parcels_detected || 0,
+        ai_extracted: stats.parcels_detected || 0,
+        requires_review: stats.requires_review || 0,
+        boundary_conflicts: stats.boundary_conflicts || 0,
+        high_confidence: stats.high_confidence_features || 0,
+        gt_verified: stats.gt_verified || 0
       });
     }
   };
 
 
-  // Load initial datasets from backend
-  const loadData = async () => {
+  // Load initial datasets from backend with mode support
+  const loadData = async (mode: 'real' | 'demo' = gisMode) => {
     try {
-      const [pList, cList, gtList, chList, topList, projList, dbStats, bList, rList] = await Promise.all([
-        apiClient.getParcels(),
-        apiClient.getConflicts(),
-        apiClient.getGroundTruthTasks(),
-        apiClient.getChangeDetection(),
-        apiClient.getTopologyIssues(),
-        apiClient.getProjects(),
-        apiClient.getDashboardStatistics(),
-        apiClient.getBuildings(),
-        apiClient.getRoads()
+      const [pList, cList, gtList, chList, topList, projList, dbStats, bList, rList, luList] = await Promise.all([
+        apiClient.getParcels(undefined, undefined, undefined, mode).catch(() => []),
+        apiClient.getConflicts(mode).catch(() => []),
+        apiClient.getGroundTruthTasks(mode).catch(() => []),
+        apiClient.getChangeDetection().catch(() => []),
+        apiClient.getTopologyIssues().catch(() => []),
+        apiClient.getProjects().catch(() => []),
+        apiClient.getDashboardStatistics(mode).catch(() => null),
+        apiClient.getBuildings(mode).catch(() => []),
+        apiClient.getRoads(mode).catch(() => []),
+        apiClient.getLandUse(undefined, mode).catch(() => []),
+        apiClient.getGISDatasets().catch(() => [])
       ]);
 
-      setParcels(pList);
-      setConflicts(cList);
-      setGroundTruthTasks(gtList);
-      setChanges(chList);
-      setTopologyIssues(topList);
-      setProjects(projList);
+      setParcels(pList || []);
+      setConflicts(cList || []);
+      setGroundTruthTasks(gtList || []);
+      setChanges(chList || []);
+      setTopologyIssues(topList || []);
+      setProjects(projList || []);
       setBuildings(bList || []);
       setRoads(rList || []);
+      setLandUse(luList || []);
+      if (arguments && arguments.length > 0) {} // no-op
+      const dsList = arguments ? (await apiClient.getGISDatasets().catch(() => [])) : [];
+      if (dsList && dsList.length > 0) {
+        setActiveDataset(dsList[0]);
+      }
       if (dbStats) {
         setDashboardStats(dbStats);
       }
 
-      // Default selected parcel is 8824-A (Flagship lot)
-      if (pList.length > 0) {
-        setSelectedParcel(pList[0]);
-      }
+      // Pure Real Mode: Do not auto-select a parcel; initially show "No parcel selected"
+      setSelectedParcel(null);
     } catch (e) {
       console.error('Failed loading backend data:', e);
     } finally {
@@ -108,8 +143,13 @@ export function App() {
     }
   };
 
+  const handleToggleGisMode = (newMode: 'real' | 'demo') => {
+    setGisMode(newMode);
+    loadData(newMode);
+  };
+
   useEffect(() => {
-    loadData();
+    loadData('real');
   }, []);
 
   const handleUpdateParcel = async (parcelId: string, updates: Partial<Parcel>) => {
@@ -128,17 +168,89 @@ export function App() {
     const found = parcels.find(p => p.id === parcelIdOrTitle || p.parcel_id === parcelIdOrTitle || p.title === parcelIdOrTitle);
     if (found) {
       setSelectedParcel(found);
-      setCurrentRoute('parcel-map');
+      navigate('parcel-map');
     }
   };
 
-  // If user is not logged in, render Login page (matching Page 4)
+  const navigate = (route: string) => {
+    setCurrentRoute(route);
+    if (typeof window !== 'undefined') {
+      const targetPath = route === 'dashboard' ? '/dashboard' : `/${route}`;
+      if (window.location.pathname !== targetPath) {
+        window.history.pushState(null, '', targetPath);
+      }
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await apiClient.logout();
+    } catch (e) {}
+    setCurrentUser(null);
+    setCurrentRoute('login');
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(null, '', '/login');
+    }
+  };
+
+  // Verify server session on application startup
+  useEffect(() => {
+    const token = localStorage.getItem('cadastral_auth_token');
+    if (token) {
+      apiClient.verifySession().then(user => {
+        if (user) {
+          setCurrentUser(user);
+        } else {
+          localStorage.removeItem('cadastral_auth_token');
+          localStorage.removeItem('cadastral_auth_user');
+          setCurrentUser(null);
+        }
+      }).catch(() => {
+        // Offline / network issue: maintain cached user
+      });
+    }
+  }, []);
+
+  // Handle browser back and forward buttons
+  useEffect(() => {
+    const handlePopState = () => {
+      const path = window.location.pathname.replace(/^\/+/, '').split('/')[0] || '';
+      if (!currentUser) {
+        setCurrentRoute('login');
+      } else if (!path || path === 'login') {
+        setCurrentRoute('dashboard');
+      } else {
+        setCurrentRoute(path);
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [currentUser]);
+
+  // Sync URL when authenticated user opens root or /login
+  useEffect(() => {
+    if (currentUser && typeof window !== 'undefined') {
+      if (window.location.pathname === '/login' || window.location.pathname === '/' || !window.location.pathname) {
+        window.history.replaceState(null, '', '/dashboard');
+      }
+    }
+  }, [currentUser]);
+
+  // Protected Routes: Unauthenticated users are redirected to /login
   if (!currentUser) {
+    if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+      window.history.replaceState(null, '', '/login');
+    }
     return (
       <Login
         onLoginSuccess={(user) => {
           setCurrentUser(user);
-          setCurrentRoute('dashboard');
+          const targetRoute = currentRoute === 'login' ? 'dashboard' : currentRoute;
+          setCurrentRoute(targetRoute);
+          if (typeof window !== 'undefined') {
+            window.history.pushState(null, '', `/${targetRoute}`);
+          }
         }}
       />
     );
@@ -151,30 +263,32 @@ export function App() {
         currentProject={currentProject}
         onProjectChange={setCurrentProject}
         currentUser={currentUser}
-        onLogout={() => setCurrentUser(null)}
-        onNavigate={(route) => setCurrentRoute(route)}
+        onLogout={handleLogout}
+        onNavigate={navigate}
       />
 
       <div className="flex-1 flex overflow-hidden">
         {/* Desktop Sidebar Navigation */}
         <Sidebar
           currentRoute={currentRoute}
-          onNavigate={(route) => {
-            setCurrentRoute(route);
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-          }}
+          onNavigate={navigate}
+          conflictsCount={conflicts.length}
+          confidenceCount={parcels.filter(p => (p.confidence_score || 0) < 0.7).length}
+          topologyPassRate={topologyIssues.length === 0 && parcels.length > 0 ? 100 : null}
+          corsConnected={false}
         />
 
         {/* Main Content Viewport */}
         <main className="flex-1 overflow-y-auto bg-slate-50 relative">
+          <GISErrorBoundary fallbackTitle="GIS VIEW ERROR">
           {currentRoute === 'dashboard' && (
             <Dashboard
               parcels={parcels}
               conflicts={conflicts}
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
               onSelectParcel={(p) => {
                 setSelectedParcel(p);
-                setCurrentRoute('parcel-map');
+                navigate('parcel-map');
               }}
               stats={dashboardStats}
             />
@@ -182,37 +296,69 @@ export function App() {
 
           {currentRoute === 'insights' && (
             <AIInsights
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
               onSelectParcel={handleSelectParcelById}
             />
           )}
 
-          {currentRoute === 'property-details' && selectedParcel && (
-            <PropertyDetails
-              parcel={selectedParcel}
-              onBack={() => setCurrentRoute('parcel-map')}
-              onCompare={() => setCurrentRoute('verification')}
-              onRequestAcquisition={(p) => {
-                setAcquisitionModalParcel(p);
-                setAcquisitionSubmitted(false);
-              }}
-            />
+          {currentRoute === 'property-details' && (
+            (selectedParcel || parcels.length > 0) ? (
+              <PropertyDetails
+                parcel={selectedParcel || parcels[0]}
+                onBack={() => navigate('parcel-map')}
+                onCompare={() => navigate('verification')}
+                onRequestAcquisition={(p) => {
+                  setAcquisitionModalParcel(p);
+                  setAcquisitionSubmitted(false);
+                }}
+              />
+            ) : (
+              <div className="flex flex-col items-center justify-center min-h-[60vh] p-8 text-center">
+                <div className="w-16 h-16 rounded-2xl bg-blue-50 border border-blue-100 flex items-center justify-center text-blue-600 mb-4">
+                  <BuildingIcon className="w-8 h-8" />
+                </div>
+                <h3 className="text-xl font-bold text-slate-800 mb-2">No Parcel Selected</h3>
+                <p className="text-sm text-slate-500 max-w-md mb-6">
+                  Select a parcel from the Cadastral Map or upload drone imagery to inspect 3D cadastral property boundaries and intelligence.
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => navigate('parcel-map')}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-sm transition-colors"
+                  >
+                    View Cadastral Map
+                  </button>
+                  <button
+                    onClick={() => navigate('drone-imagery')}
+                    className="px-4 py-2 bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition-colors"
+                  >
+                    Upload Drone Ortho
+                  </button>
+                </div>
+              </div>
+            )
           )}
 
-          {currentRoute === 'parcel-map' && selectedParcel && (
+          {currentRoute === 'parcel-map' && (
             <ParcelMap
               parcels={parcels}
               conflicts={conflicts}
+              buildings={buildings}
+              roads={roads}
+              landUse={landUse}
+              groundTruthTasks={groundTruthTasks}
               selectedParcel={selectedParcel}
               onSelectParcel={setSelectedParcel}
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
               onUpdateParcel={handleUpdateParcel}
+              gisMode={gisMode}
+              onToggleMode={handleToggleGisMode}
             />
           )}
 
           {currentRoute === 'drone-imagery' && (
             <DroneImageryUpload
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
               onDatasetProcessed={handleDatasetProcessed}
             />
           )}
@@ -220,7 +366,7 @@ export function App() {
 
           {currentRoute === 'ai-extraction' && (
             <AIExtraction
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
             />
           )}
 
@@ -228,7 +374,7 @@ export function App() {
             <ConflictDetection
               conflicts={conflicts}
               onSelectParcel={handleSelectParcelById}
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
               onRefreshConflicts={loadData}
             />
           )}
@@ -238,25 +384,43 @@ export function App() {
               parcels={parcels}
               onSelectParcel={(p) => {
                 setSelectedParcel(p);
-                setCurrentRoute('verification');
+                navigate('verification');
               }}
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
             />
           )}
 
-          {currentRoute === 'verification' && (selectedParcel || parcels.length > 0) && (
-            <Verification
-              parcel={selectedParcel || parcels[0]}
-              onUpdateParcel={handleUpdateParcel}
-              onNavigate={setCurrentRoute}
-            />
+          {currentRoute === 'verification' && (
+            (selectedParcel || parcels.length > 0) ? (
+              <Verification
+                parcel={selectedParcel || parcels[0]}
+                onUpdateParcel={handleUpdateParcel}
+                onNavigate={navigate}
+              />
+            ) : (
+              <div className="flex flex-col items-center justify-center min-h-[60vh] p-8 text-center">
+                <div className="w-16 h-16 rounded-2xl bg-amber-50 border border-amber-100 flex items-center justify-center text-amber-600 mb-4">
+                  <CheckSquare className="w-8 h-8" />
+                </div>
+                <h3 className="text-xl font-bold text-slate-800 mb-2">No Verification Items in Queue</h3>
+                <p className="text-sm text-slate-500 max-w-md mb-6">
+                  There are currently no parcels flagged for manual surveyor verification. Once drone imagery is processed and boundary ambiguities are detected, they will appear here.
+                </p>
+                <button
+                  onClick={() => navigate('drone-imagery')}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-sm transition-colors"
+                >
+                  Upload Drone Imagery
+                </button>
+              </div>
+            )
           )}
 
           {currentRoute === 'ground-truth' && (
             <GroundTruth
               tasks={groundTruthTasks}
               onSelectParcel={handleSelectParcelById}
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
               onRefreshTasks={loadData}
             />
           )}
@@ -265,7 +429,7 @@ export function App() {
             <ChangeDetection
               changes={changes}
               onSelectParcel={handleSelectParcelById}
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
             />
           )}
 
@@ -273,16 +437,22 @@ export function App() {
             <TopologyValidator
               issues={topologyIssues}
               onSelectParcel={handleSelectParcelById}
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
             />
           )}
 
-          {currentRoute === 'gis-editor' && (selectedParcel || parcels.length > 0) && (
+          {currentRoute === 'gis-editor' && (
             <GISEditor
               parcels={parcels}
-              selectedParcel={selectedParcel || parcels[0]}
+              selectedParcel={selectedParcel || (parcels.length > 0 ? parcels[0] : null)}
               onSelectParcel={setSelectedParcel}
               onUpdateParcel={handleUpdateParcel}
+              onRefreshData={loadData}
+              conflicts={conflicts}
+              buildings={buildings}
+              roads={roads}
+              landUse={landUse}
+              activeDataset={activeDataset}
             />
           )}
 
@@ -302,16 +472,30 @@ export function App() {
               projects={projects}
               parcels={parcels}
               onSelectParcel={setSelectedParcel}
-              onNavigate={setCurrentRoute}
+              onNavigate={navigate}
             />
           )}
+
+          {!['dashboard', 'insights', 'property-details', 'parcel-map', 'drone-imagery', 'ai-extraction', 'conflicts', 'confidence', 'verification', 'ground-truth', 'change-detection', 'topology', 'gis-editor', 'reports', 'audit', 'buildings', 'roads', 'land-use', 'projects', 'settings'].includes(currentRoute) && (
+            <Dashboard
+              parcels={parcels}
+              conflicts={conflicts}
+              onNavigate={navigate}
+              onSelectParcel={(p) => {
+                setSelectedParcel(p);
+                navigate('parcel-map');
+              }}
+              stats={dashboardStats}
+            />
+          )}
+          </GISErrorBoundary>
         </main>
       </div>
 
       {/* Mobile Bottom Navigation matching Page 1 & Page 3 */}
       <MobileNav
         currentRoute={currentRoute}
-        onNavigate={(route) => setCurrentRoute(route)}
+        onNavigate={navigate}
         onOpenMobileDrawer={() => setMobileDrawerOpen(true)}
       />
 
@@ -336,7 +520,7 @@ export function App() {
                 { id: 'parcel-map', label: 'Cadastral Map' },
                 { id: 'property-details', label: 'Property (3D)' },
                 { id: 'ai-extraction', label: 'AI Extraction' },
-                { id: 'conflicts', label: 'Conflicts (126)' },
+                { id: 'conflicts', label: `Conflicts (${conflicts.length})` },
                 { id: 'confidence', label: 'Confidence Queue' },
                 { id: 'verification', label: 'Verification' },
                 { id: 'ground-truth', label: 'Ground Truth CORS' },
@@ -355,7 +539,7 @@ export function App() {
                 <button
                   key={m.id}
                   onClick={() => {
-                    setCurrentRoute(m.id);
+                    navigate(m.id);
                     setMobileDrawerOpen(false);
                   }}
                   className={`p-3 rounded-xl text-left font-semibold transition-colors ${

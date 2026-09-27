@@ -47,7 +47,7 @@ export const GroundTruth: React.FC<GroundTruthProps> = ({
   
   // New Task Modal
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
-  const [newParcelId, setNewParcelId] = useState('TN-CAD-004-01874');
+  const [newParcelId, setNewParcelId] = useState('');
   const [newReason, setNewReason] = useState('DGPS boundary demarcation on eastern road setback');
   const [newSurveyor, setNewSurveyor] = useState('P. Meenakshi (Senior Field Surveyor)');
 
@@ -150,7 +150,7 @@ export const GroundTruth: React.FC<GroundTruthProps> = ({
       surveyor: newSurveyor,
       gnss_accuracy_cm: 1.5,
       cors_reference: 'TN-CORS-KA-04',
-      coordinates: [12.9785, 77.6410]
+      coordinates: undefined
     });
     setActiveTasks([created, ...activeTasks]);
     setShowNewTaskModal(false);

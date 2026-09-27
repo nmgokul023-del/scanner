@@ -36,24 +36,29 @@ export const Verification: React.FC<VerificationProps> = ({
   const handleAction = async (actionType: string) => {
     try {
       if (actionType === 'Accept AI') {
-        onUpdateParcel(parcel.id, { status: 'Verified', confidence_score: 0.99 });
-        setStatusMessage(`Accepted AI boundary for ${parcel.parcel_id}. Verified in registry.`);
+        onUpdateParcel(parcel.id, { status: 'Human-verified' });
+        setStatusMessage(`Accepted candidate AI boundary for ${parcel.parcel_id}. Promoted to Human-verified.`);
       } else if (actionType === 'Correct Boundary') {
         onUpdateParcel(parcel.id, { 
-          status: 'Verified', 
+          status: 'Human-verified', 
           ai_area_sqm: correctedArea, 
-          difference_sqm: correctedArea - parcel.existing_area_sqm 
+          difference_sqm: Math.round((correctedArea - parcel.existing_area_sqm) * 100) / 100 
         });
-        setStatusMessage(`Saved corrected boundary (${correctedArea} m²) to cadastral state.`);
+        setStatusMessage(`Saved surveyor-corrected boundary (${correctedArea} m²) as Human-verified.`);
+      } else if (actionType === 'Finalize') {
+        onUpdateParcel(parcel.id, { status: 'Final' });
+        setStatusMessage(`Official cadastral sign-off recorded. Status promoted to Final.`);
       } else if (actionType === 'Reject') {
         onUpdateParcel(parcel.id, { status: 'Rejected' });
-        setStatusMessage(`Rejected AI boundary for ${parcel.parcel_id}. Retaining baseline.`);
+        setStatusMessage(`Rejected candidate AI boundary for ${parcel.parcel_id}. Retaining official deed record.`);
       } else if (actionType === 'Send to Ground Truth') {
         await apiClient.createGroundTruthTask({
           parcel_id: parcel.parcel_id,
           reason: notes || 'Cadastral boundary requires DGPS total station survey verification',
           surveyor: 'R. Ramanathan',
-          coordinates: [12.9785, 77.6405]
+          coordinates: (parcel.geometry && parcel.geometry.coordinates && parcel.geometry.coordinates[0] && parcel.geometry.coordinates[0][0])
+            ? [parcel.geometry.coordinates[0][0][1], parcel.geometry.coordinates[0][0][0]]
+            : null
         });
         setStatusMessage(`Dispatched ground-truth CORS survey task.`);
         setTimeout(() => onNavigate('ground-truth'), 900);
@@ -74,34 +79,49 @@ export const Verification: React.FC<VerificationProps> = ({
               Human-in-the-Loop Cadastral Verification
             </h1>
           </div>
-          <p className="text-xs text-slate-500 font-medium mt-1">
-            Parcel: <span className="font-bold text-slate-800">{parcel.parcel_id}</span> ({parcel.address})
-          </p>
+          <div className="flex items-center gap-2 mt-1">
+            <p className="text-xs text-slate-500 font-medium">
+              Parcel: <span className="font-bold text-slate-800">{parcel.parcel_id}</span> ({parcel.address})
+            </p>
+            <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+              parcel.status === 'Final' ? 'bg-emerald-100 text-emerald-800 border border-emerald-300' :
+              parcel.status === 'Human-verified' ? 'bg-blue-100 text-blue-800 border border-blue-300' :
+              'bg-sky-100 text-sky-800 border border-sky-300'
+            }`}>
+              {parcel.status || 'AI-generated (Probable)'}
+            </span>
+          </div>
         </div>
 
-        {/* Verification Action Buttons matching Section 13 */}
+        {/* Verification Action Buttons */}
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => handleAction('Accept AI')}
-            className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-xl shadow-sm flex items-center gap-1.5 transition-colors"
+            className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-xl shadow-sm flex items-center gap-1.5 transition-colors"
           >
             <Check className="w-4 h-4" /> Accept AI
           </button>
           <button
             onClick={() => handleAction('Correct Boundary')}
-            className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-xl shadow-sm flex items-center gap-1.5 transition-colors"
+            className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-xl shadow-sm flex items-center gap-1.5 transition-colors"
           >
             <Save className="w-4 h-4" /> Correct Boundary
           </button>
           <button
+            onClick={() => handleAction('Finalize')}
+            className="px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white text-xs font-semibold rounded-xl shadow-sm flex items-center gap-1.5 transition-colors"
+          >
+            <Sparkles className="w-4 h-4" /> Final Sign-off
+          </button>
+          <button
             onClick={() => handleAction('Reject')}
-            className="px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-semibold rounded-xl border border-rose-200 transition-colors"
+            className="px-3 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-semibold rounded-xl border border-rose-200 transition-colors"
           >
             <X className="w-4 h-4" /> Reject
           </button>
           <button
             onClick={() => handleAction('Send to Ground Truth')}
-            className="px-3.5 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold rounded-xl shadow-sm flex items-center gap-1.5 transition-colors"
+            className="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold rounded-xl shadow-sm flex items-center gap-1.5 transition-colors"
           >
             <Send className="w-4 h-4" /> Send to Ground Truth
           </button>
